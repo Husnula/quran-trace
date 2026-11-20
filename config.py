@@ -40,9 +40,13 @@ COLORS = {
 
 FONTS = {
     "display":  ("Segoe UI", 16, "bold"),
+    "title":    ("Segoe UI", 14, "bold"),
     "heading":  ("Segoe UI", 12, "bold"),
+    "section":  ("Segoe UI", 11, "bold"),
+    "label":    ("Segoe UI", 10),
     "body":     ("Segoe UI", 10),
     "caption":  ("Segoe UI", 9),
+    "small":    ("Segoe UI", 9),
     "mono":     ("Consolas", 9),
 }
 
