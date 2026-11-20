@@ -15,19 +15,9 @@ from pathlib import Path
 
 
 def run_gui():
-    """Jalankan aplikasi GUI Tkinter."""
-    try:
-        import sv_ttk
-        _has_sv_ttk = True
-    except ImportError:
-        _has_sv_ttk = False
-
+    """Jalankan aplikasi GUI CustomTkinter."""
     from gui.app import TraceQuranApp
     app = TraceQuranApp()
-
-    if _has_sv_ttk:
-        sv_ttk.set_theme("light")
-
     app.mainloop()
 
 

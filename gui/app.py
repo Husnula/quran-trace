@@ -1,835 +1,1018 @@
 """
 gui/app.py
-Aplikasi Desktop Windows - Trace Qur'an (Duta Ilmu)
+Trace Qur'an (Duta Ilmu) - Aplikasi Desktop Windows
+UI baru berbasis CustomTkinter. Logika pemrosesan (processor/) tidak diubah.
 Engine: PyMuPDF + OpenCV (300 DPI High-Precision)
 """
 from __future__ import annotations
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from pathlib import Path
-import threading
+
 import os
+import sys
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
 from PIL import Image, ImageTk
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+root_dir = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(root_dir))
 from config import (
-    COLORS, FONTS, WINDOW_MIN_W, WINDOW_MIN_H, PANEL_LEFT_W,
     FADE_PRESETS, FADE_DEFAULT, FADE_MIN, FADE_MAX,
     DPI_PRINT, DPI_DRAFT, DPI_PREVIEW,
 )
 from processor import process_pdf, preview_page
-from processor.pdf_writer import build_output_path
 from processor.pdf_reader import open_pdf, render_page, page_count
 
+# ── Palet warna (selaras dengan versi web) ──────────────────────────────────
+BG = "#F2F5F1"
+CARD = "#FFFFFF"
+BORDER = "#DDE5DE"
+HEADER = "#17352A"
+AMBER = "#F5B731"
+GREEN = "#1F7A4F"
+GREEN_HOVER = "#17613E"
+GREEN_SOFT = "#E7F3EB"
+GREEN_LINE = "#B9D8C5"
+TEXT = "#1A2820"
+MUTED = "#66766D"
+CHIP = "#EDF1ED"
+DISABLED = "#A9B8AF"
+DANGER = "#C0392B"
+PREVIEW_BG = "#E6EAE5"
 
-class TraceQuranApp(tk.Tk):
+FONT = "Segoe UI"
+MODE_TRACE = "Hasil tracing"
+MODE_ORIG = "Gambar asli"
+
+
+def _font(size: int, weight: str = "normal") -> ctk.CTkFont:
+    return ctk.CTkFont(family=FONT, size=size, weight=weight)
+
+
+def _shorten(path: str, limit: int = 40) -> str:
+    """Potong path panjang di bagian tengah agar tetap muat di satu baris."""
+    if len(path) <= limit:
+        return path
+    keep = (limit - 3) // 2
+    return f"{path[:keep]}...{path[-keep:]}"
+
+
+def _bind_click(widget, callback):
+    """Pasang klik + kursor tangan ke widget beserta semua anaknya."""
+    widget.bind("<Button-1>", lambda e: callback())
+    try:
+        widget.configure(cursor="hand2")
+    except Exception:
+        pass
+    for child in widget.winfo_children():
+        _bind_click(child, callback)
+
+
+class TraceQuranApp(ctk.CTk):
     def __init__(self):
-        super().__init__()
-        self.title("Trace Qur'an - Duta Ilmu")
-        self.minsize(1040, 720)
-        self.geometry("1100x780")
-        self.configure(bg="#F4F6F8")
+        ctk.set_appearance_mode("light")
+        ctk.set_default_color_theme("green")
+        super().__init__(fg_color=BG)
 
-        # State
+        self.title("Trace Qur'an - Duta Ilmu")
+        self.geometry("1200x820")
+        self.minsize(1080, 700)
+
+        # ── State ────────────────────────────────────────────────────────
         self._pdf_path: str | None = None
-        self._total_pages: int = 0
-        self._preview_page_num: int = 0
-        self._cancel_flag: list[bool] = [False]
-        self._processing: bool = False
-        self._preview_mode: str = "trace"  # "trace" atau "original"
+        self._total_pages = 0
+        self._page = 0
+        self._model = "gray"
+        self._opacity = float(FADE_PRESETS[FADE_DEFAULT])
+        self._preview_mode = "trace"
         self._output_folder: Path | None = None
-        self._last_trace_img: Image.Image | None = None
-        self._last_orig_img: Image.Image | None = None
+        self._processing = False
+        self._cancel_flag: list[bool] = [False]
+        self._last_dpi = DPI_PRINT
+
+        self._trace_img: Image.Image | None = None
+        self._orig_img: Image.Image | None = None
+        self._orig_page = -1
+        self._preview_req = 0
         self._preview_timer = None
 
-        # Tkinter variables
-        self._model_var = tk.StringVar(value="gray")
-        self._fade_preset = tk.StringVar(value=FADE_DEFAULT)
-        self._opacity_var = tk.DoubleVar(value=FADE_PRESETS[FADE_DEFAULT])
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._drag_from: tuple[int, int] | None = None
+        self._photo: ImageTk.PhotoImage | None = None
+        self._photo_key: tuple | None = None
+
         self._keep_border = tk.BooleanVar(value=True)
         self._keep_waqf = tk.BooleanVar(value=True)
         self._keep_ayat = tk.BooleanVar(value=True)
-        self._dpi_var = tk.StringVar(value="Cetak (300 DPI)")
-        self._output_folder_var = tk.StringVar(value="")
-        self._output_filename_var = tk.StringVar(value="")
-        self._status_var = tk.StringVar(value="Siap - Silakan pilih file PDF Al-Qur'an")
-        self._progress_var = tk.DoubleVar(value=0.0)
-        self._progress_label_var = tk.StringVar(value="")
-
-        # Watchers untuk Auto-Preview
-        self._model_var.trace_add("write", lambda *_: self._schedule_preview())
-        self._fade_preset.trace_add("write", self._on_preset_change)
+        self._quality_var = tk.StringVar(value="Cetak 300 DPI")
 
         self._build_ui()
-        self._setup_keybindings()
+        self._bind_keys()
 
-    # ── UI Builder ──────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # Layout
+    # ══════════════════════════════════════════════════════════════════════
 
     def _build_ui(self):
-        # 1. Header Banner Atas
-        self._build_top_header()
+        self._build_header()
+        tk.Frame(self, bg=AMBER, height=2).pack(fill="x")
+        self._build_statusbar()
 
-        # 2. Body Container (Left Settings + Right Preview)
-        body = tk.Frame(self, bg="#F4F6F8")
-        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=16, pady=14)
 
-        # Left panel (Settings)
-        left_card = tk.Frame(body, bg="#FFFFFF", width=380, highlightthickness=1, highlightbackground="#E2E8F0")
-        left_card.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10), pady=4)
-        left_card.pack_propagate(False)
+        left = ctk.CTkFrame(body, fg_color="transparent", width=420)
+        left.pack(side="left", fill="y", padx=(0, 14))
+        left.pack_propagate(False)
 
-        # Right panel (Preview)
-        right_card = tk.Frame(body, bg="#FFFFFF", highlightthickness=1, highlightbackground="#E2E8F0")
-        right_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=4)
+        right = ctk.CTkFrame(
+            body, fg_color=CARD, corner_radius=14,
+            border_width=1, border_color=BORDER,
+        )
+        right.pack(side="left", fill="both", expand=True)
 
-        self._build_left_panel(left_card)
-        self._build_right_panel(right_card)
+        self._build_left(left)
+        self._build_preview(right)
 
-        # 3. Status Bar Bawah
-        status_bar = tk.Frame(self, bg="#FFFFFF", height=30, highlightthickness=1, highlightbackground="#E2E8F0")
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-        tk.Label(
-            status_bar,
-            textvariable=self._status_var,
-            bg="#FFFFFF",
-            fg="#64748B",
-            font=("Segoe UI", 9),
-            anchor="w",
-            padx=14,
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-    def _build_top_header(self):
-        header = tk.Frame(self, bg="#0F5132", height=64)
-        header.pack(fill=tk.X, side=tk.TOP)
+    def _build_header(self):
+        header = ctk.CTkFrame(self, fg_color=HEADER, corner_radius=0, height=68)
+        header.pack(fill="x")
         header.pack_propagate(False)
 
-        content = tk.Frame(header, bg="#0F5132")
-        content.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
-
-        # Title & Badge
-        title_row = tk.Frame(content, bg="#0F5132")
-        title_row.pack(side=tk.LEFT, fill=tk.Y)
-
-        tk.Label(
-            title_row,
-            text="TRACE QUR'AN",
-            font=("Segoe UI", 15, "bold"),
-            bg="#0F5132",
-            fg="#FFFFFF",
-        ).pack(side=tk.LEFT)
-
-        badge = tk.Label(
-            title_row,
-            text=" DUTA ILMU ",
-            font=("Segoe UI", 9, "bold"),
-            bg="#D1E7DD",
-            fg="#0F5132",
-            padx=6,
-            pady=2,
+        logo = ctk.CTkLabel(
+            header, text="✒", width=40, height=40, corner_radius=10,
+            fg_color=AMBER, text_color=HEADER, font=_font(20, "bold"),
         )
-        badge.pack(side=tk.LEFT, padx=8)
+        logo.pack(side="left", padx=(20, 12))
 
-        tk.Label(
-            content,
-            text="Aplikasi Pembuat Lembar Latihan Menulis Kaligrafi Al-Qur'an (300 DPI High-Precision)",
-            font=("Segoe UI", 9),
-            bg="#0F5132",
-            fg="#A3CFBB",
-        ).pack(side=tk.BOTTOM, anchor="w", pady=(2, 0))
+        titles = ctk.CTkFrame(header, fg_color="transparent")
+        titles.pack(side="left")
+        row = ctk.CTkFrame(titles, fg_color="transparent")
+        row.pack(anchor="w")
+        ctk.CTkLabel(
+            row, text="Arabic Tracing Maker", font=_font(17, "bold"), text_color="white",
+        ).pack(side="left")
+        ctk.CTkLabel(
+            row, text=" Duta Ilmu ", height=20, corner_radius=6,
+            fg_color=AMBER, text_color=HEADER, font=_font(10, "bold"),
+        ).pack(side="left", padx=10)
+        ctk.CTkLabel(
+            titles,
+            text="Ubah PDF mushaf menjadi lembar latihan menebalkan (300 DPI)",
+            font=_font(11), text_color="#9CC8AE",
+        ).pack(anchor="w")
 
-        # Status badge di kanan
-        self._badge_ready = tk.Label(
-            content,
-            text="● Siap Digunakan",
-            font=("Segoe UI", 9, "bold"),
-            bg="#0F5132",
-            fg="#75B798",
+        self._reset_btn = ctk.CTkButton(
+            header, text="Reset", width=76, height=30, corner_radius=15,
+            fg_color="transparent", border_width=1, border_color="#3E6B58",
+            hover_color="#24503D", text_color="white", font=_font(12, "bold"),
+            command=self._reset,
         )
-        self._badge_ready.pack(side=tk.RIGHT, anchor="center")
+        self._reset_btn.pack(side="right", padx=(8, 20))
 
-    def _build_left_panel(self, parent):
-        canvas = tk.Canvas(parent, bg="#FFFFFF", highlightthickness=0)
-        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
-        frame = tk.Frame(canvas, bg="#FFFFFF")
-        frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=frame, anchor="nw", width=360)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        p = 14
-
-        # ── 1. Upload File PDF ─────────────────────────────────────────────
-        _section_header(frame, "1. UPLOAD FILE PDF")
-        
-        self._upload_box = tk.Frame(frame, bg="#F8FAFC", highlightthickness=1, highlightbackground="#CBD5E1", padx=10, pady=12)
-        self._upload_box.pack(fill=tk.X, padx=p, pady=(4, 6))
-
-        self._btn_pick_file = tk.Button(
-            self._upload_box,
-            text="📂 Pilih File PDF Al-Qur'an",
-            command=self._pick_pdf_dialog,
-            font=("Segoe UI", 10, "bold"),
-            bg="#198754",
-            fg="#FFFFFF",
-            activebackground="#157347",
-            activeforeground="#FFFFFF",
-            relief=tk.FLAT,
-            cursor="hand2",
-            pady=8,
+        self._pill = ctk.CTkLabel(
+            header, text="  ●  Siap digunakan  ", height=30, corner_radius=15,
+            fg_color="#24503D", text_color="#9FE3BA", font=_font(12, "bold"),
         )
-        self._btn_pick_file.pack(fill=tk.X)
+        self._pill.pack(side="right")
 
-        self._upload_hint = tk.Label(
-            self._upload_box,
-            text="Klik tombol di atas untuk memilih Mushaf PDF",
-            font=("Segoe UI", 8),
-            bg="#F8FAFC",
-            fg="#64748B",
-            pady=4,
-        )
-        self._upload_hint.pack()
-
-        # File Selected Card (tersembunyi sampai file dipilih)
-        self._file_card = tk.Frame(frame, bg="#E8F5E9", highlightthickness=1, highlightbackground="#A5D6A7", padx=10, pady=8)
-        self._file_name_lbl = tk.Label(
-            self._file_card, text="", font=("Segoe UI", 9, "bold"),
-            bg="#E8F5E9", fg="#1B5E20", anchor="w", wraplength=260
-        )
-        self._file_name_lbl.pack(fill=tk.X)
-        self._file_meta_lbl = tk.Label(
-            self._file_card, text="", font=("Segoe UI", 8),
-            bg="#E8F5E9", fg="#2E7D32", anchor="w"
-        )
-        self._file_meta_lbl.pack(fill=tk.X, pady=(2, 0))
-
-        _divider(frame)
-
-        # ── 2. Model Tracing ───────────────────────────────────────────────
-        _section_header(frame, "2. PILIH MODEL TRACING")
-        model_box = tk.Frame(frame, bg="#FFFFFF")
-        model_box.pack(fill=tk.X, padx=p, pady=2)
-
-        # Model A Card
-        rb_a = tk.Radiobutton(
-            model_box,
-            text=" Model A: Light Gray\n  Tulisan Arab jadi abu-abu tipis (standar FunFurqan)",
-            variable=self._model_var,
-            value="gray",
-            font=("Segoe UI", 9, "bold"),
-            bg="#FFFFFF",
-            fg="#1E293B",
-            selectcolor="#D1E7DD",
-            activebackground="#FFFFFF",
-            justify=tk.LEFT,
-        )
-        rb_a.pack(anchor="w", pady=(0, 6))
-
-        # Model B Card
-        rb_b = tk.Radiobutton(
-            model_box,
-            text=" Model B: Outline (Hollow)\n  Garis tepi kaligrafi tipis, huruf berongga putih",
-            variable=self._model_var,
-            value="outline",
-            font=("Segoe UI", 9, "bold"),
-            bg="#FFFFFF",
-            fg="#1E293B",
-            selectcolor="#D1E7DD",
-            activebackground="#FFFFFF",
-            justify=tk.LEFT,
-        )
-        rb_b.pack(anchor="w")
-
-        _divider(frame)
-
-        # ── 3. Tingkat Kepekatan Samar ───────────────────────────────────
-        _section_header(frame, "3. TINGKAT KEPEKATAN ABU-ABU")
-        preset_row = tk.Frame(frame, bg="#FFFFFF")
-        preset_row.pack(fill=tk.X, padx=p, pady=2)
-
-        for label in ["Sangat Samar", "Samar", "Agak Terlihat"]:
-            pct_val = int(FADE_PRESETS[label] * 100)
-            tk.Radiobutton(
-                preset_row,
-                text=f"{label} ({pct_val}%)",
-                variable=self._fade_preset,
-                value=label,
-                font=("Segoe UI", 9),
-                bg="#FFFFFF",
-                fg="#1E293B",
-                selectcolor="#D1E7DD",
-                activebackground="#FFFFFF",
-            ).pack(anchor="w", pady=1)
-
-        slider_box = tk.Frame(frame, bg="#FFFFFF")
-        slider_box.pack(fill=tk.X, padx=p, pady=(6, 0))
-        tk.Label(slider_box, text="Slider:", font=("Segoe UI", 9), bg="#FFFFFF", fg="#64748B").pack(side=tk.LEFT)
-        self._slider = ttk.Scale(
-            slider_box, from_=FADE_MIN, to=FADE_MAX,
-            orient=tk.HORIZONTAL, variable=self._opacity_var,
-            command=self._on_slider_move,
-        )
-        self._slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-        self._slider.bind("<ButtonRelease-1>", lambda e: self._schedule_preview())
-
-        self._slider_pct_label = tk.Label(
-            slider_box, text=f"{int(self._opacity_var.get()*100)}%",
-            font=("Segoe UI", 9, "bold"), bg="#FFFFFF", fg="#198754", width=5,
-        )
-        self._slider_pct_label.pack(side=tk.LEFT)
-
-        _divider(frame)
-
-        # ── 4. Pertahankan Hitam ──────────────────────────────────────────
-        _section_header(frame, "4. ELEMEN TETAP HITAM PEKAT")
-        for text, var in [
-            ("Border ornamen halaman mushaf", self._keep_border),
-            ("Tanda waqf margin ('ع' waqf lazim & ruku')", self._keep_waqf),
-            ("Nomor ayat dalam lingkaran roset", self._keep_ayat),
-        ]:
-            cb = tk.Checkbutton(
-                frame, text=text, variable=var,
-                font=("Segoe UI", 9), bg="#FFFFFF", fg="#1E293B",
-                selectcolor="#D1E7DD", activebackground="#FFFFFF",
-                command=self._schedule_preview,
-            )
-            cb.pack(anchor="w", padx=p, pady=1)
-
-        _divider(frame)
-
-        # ── 5. Folder Penyimpanan Output ──────────────────────────────────
-        _section_header(frame, "5. FOLDER PENYIMPANAN OUTPUT")
-        out_box = tk.Frame(frame, bg="#F8FAFC", highlightthickness=1, highlightbackground="#CBD5E1", padx=10, pady=8)
-        out_box.pack(fill=tk.X, padx=p, pady=2)
-
-        self._btn_pick_folder = tk.Button(
-            out_box,
-            text="📁 Pilih Folder Penyimpanan...",
-            command=self._pick_folder_dialog,
-            font=("Segoe UI", 9, "bold"),
-            bg="#F1F5F9",
-            fg="#1E293B",
-            relief=tk.FLAT,
-            cursor="hand2",
-            padx=8,
-            pady=4,
-            highlightthickness=1,
-            highlightbackground="#CBD5E1",
-        )
-        self._btn_pick_folder.pack(fill=tk.X, pady=(0, 4))
-
-        self._folder_label = tk.Label(
-            out_box,
-            text="Folder: (Sama dengan folder file PDF)",
-            font=("Segoe UI", 8),
-            bg="#F8FAFC",
-            fg="#64748B",
-            anchor="w",
-            wraplength=320,
-            justify=tk.LEFT,
-        )
-        self._folder_label.pack(fill=tk.X)
-
-        self._filename_label = tk.Label(
-            out_box,
-            text="Nama Hasil: -",
-            font=("Segoe UI", 8, "bold"),
-            bg="#F8FAFC",
-            fg="#198754",
-            anchor="w",
-            pady=2,
-        )
-        self._filename_label.pack(fill=tk.X)
-
-        # Kualitas Cetak
-        dpi_row = tk.Frame(frame, bg="#FFFFFF")
-        dpi_row.pack(fill=tk.X, padx=p, pady=(8, 0))
-        tk.Label(dpi_row, text="Kualitas:", font=("Segoe UI", 9, "bold"), bg="#FFFFFF", fg="#1E293B").pack(side=tk.LEFT)
-        for txt in ["Cetak (300 DPI)", "Draft (150 DPI)"]:
-            tk.Radiobutton(
-                dpi_row, text=txt, variable=self._dpi_var, value=txt,
-                font=("Segoe UI", 9), bg="#FFFFFF", fg="#1E293B",
-                selectcolor="#D1E7DD", activebackground="#FFFFFF",
-            ).pack(side=tk.LEFT, padx=(6, 0))
-
-        _divider(frame)
-
-        # ── 6. Progress & Tombol Eksekusi ─────────────────────────────────
-        self._progress_label = tk.Label(
-            frame, textvariable=self._progress_label_var,
-            font=("Segoe UI", 9), bg="#FFFFFF", fg="#64748B", anchor="w",
-        )
-        self._progress_label.pack(fill=tk.X, padx=p, pady=(4, 2))
-
-        self._progress_bar = ttk.Progressbar(
-            frame, variable=self._progress_var, maximum=100, mode="determinate"
-        )
-        self._progress_bar.pack(fill=tk.X, padx=p, pady=(0, 10))
-
-        self._btn_process = tk.Button(
-            frame,
-            text="⚡ PROSES & UNDUH SEMUA HALAMAN (300 DPI)",
-            command=self._do_process,
-            font=("Segoe UI", 10, "bold"),
-            bg="#198754",
-            fg="#FFFFFF",
-            activebackground="#157347",
-            activeforeground="#FFFFFF",
-            relief=tk.FLAT,
-            cursor="hand2",
-            pady=10,
-        )
-        self._btn_process.pack(fill=tk.X, padx=p, pady=(0, 6))
-
-        self._btn_cancel = tk.Button(
-            frame, text="Batalkan Proses", command=self._do_cancel,
-            font=("Segoe UI", 9), bg="#FFFFFF", fg="#DC3545",
-            relief=tk.FLAT, cursor="hand2", pady=4, state=tk.DISABLED,
-        )
-        self._btn_cancel.pack(fill=tk.X, padx=p, pady=(0, p))
-
-    def _build_right_panel(self, parent):
-        # 1. Header Preview Bar
-        bar = tk.Frame(parent, bg="#FFFFFF", height=48, highlightthickness=1, highlightbackground="#E2E8F0")
-        bar.pack(fill=tk.X, side=tk.TOP)
+    def _build_statusbar(self):
+        bar = ctk.CTkFrame(self, fg_color=CARD, corner_radius=0, height=28)
+        bar.pack(side="bottom", fill="x")
         bar.pack_propagate(False)
-
-        # Kiri: Mode Toggle (Hasil Tracing vs Gambar Asli)
-        tabs_box = tk.Frame(bar, bg="#FFFFFF")
-        tabs_box.pack(side=tk.LEFT, padx=12)
-
-        self._btn_mode_trace = tk.Button(
-            tabs_box, text="✨ Hasil Tracing", font=("Segoe UI", 9, "bold"),
-            bg="#198754", fg="#FFFFFF", relief=tk.FLAT, padx=10, pady=4, cursor="hand2",
-            command=lambda: self._set_preview_mode("trace"),
+        self._status = ctk.CTkLabel(
+            bar, text="Pilih file PDF mushaf untuk memulai.",
+            font=_font(11), text_color=MUTED, anchor="w",
         )
-        self._btn_mode_trace.pack(side=tk.LEFT, padx=(0, 4))
+        self._status.pack(side="left", padx=16)
 
-        self._btn_mode_orig = tk.Button(
-            tabs_box, text="📖 Gambar Asli", font=("Segoe UI", 9),
-            bg="#F1F5F9", fg="#475569", relief=tk.FLAT, padx=10, pady=4, cursor="hand2",
-            command=lambda: self._set_preview_mode("original"),
+    # ── Panel kiri ──────────────────────────────────────────────────────────
+
+    def _card(self, parent, step: int, title: str):
+        card = ctk.CTkFrame(
+            parent, fg_color=CARD, corner_radius=14,
+            border_width=1, border_color=BORDER,
         )
-        self._btn_mode_orig.pack(side=tk.LEFT)
+        card.pack(fill="x", pady=(0, 10))
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.pack(fill="x", padx=16, pady=(14, 8))
+        ctk.CTkLabel(
+            head, text=str(step), width=24, height=24, corner_radius=12,
+            fg_color=GREEN, text_color="white", font=_font(11, "bold"),
+        ).pack(side="left")
+        ctk.CTkLabel(
+            head, text=title, font=_font(14, "bold"), text_color=TEXT,
+        ).pack(side="left", padx=10)
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.pack(fill="x", padx=16, pady=(0, 16))
+        return body
 
-        # Kanan: Navigasi Halaman
-        nav_box = tk.Frame(bar, bg="#FFFFFF")
-        nav_box.pack(side=tk.RIGHT, padx=12)
+    def _build_left(self, left):
+        # Area aksi menempel di bawah (selalu terlihat, tanpa scroll)
+        self._build_action_card(left)
 
-        self._btn_prev = tk.Button(
-            nav_box, text="◀ Prev", font=("Segoe UI", 9, "bold"),
-            bg="#F1F5F9", fg="#1E293B", relief=tk.FLAT, padx=8, pady=3, cursor="hand2",
-            command=self._prev_page,
+        scroll = ctk.CTkScrollableFrame(
+            left, fg_color="transparent", corner_radius=0,
+            scrollbar_button_color="#C9D5CC", scrollbar_button_hover_color="#AFC0B4",
         )
-        self._btn_prev.pack(side=tk.LEFT, padx=2)
+        scroll.pack(side="top", fill="both", expand=True)
 
-        tk.Label(nav_box, text="Hal", font=("Segoe UI", 9), bg="#FFFFFF", fg="#64748B").pack(side=tk.LEFT, padx=(4, 2))
+        self._build_upload_card(scroll)
+        self._build_style_card(scroll)
+        self._build_keep_card(scroll)
 
-        self._page_spin = ttk.Spinbox(
-            nav_box, from_=1, to=1, width=4, font=("Segoe UI", 9),
-            command=self._on_page_spin_change,
+    def _build_upload_card(self, parent):
+        body = self._card(parent, 1, "File PDF")
+
+        self._drop = ctk.CTkFrame(
+            body, fg_color=GREEN_SOFT, corner_radius=12,
+            border_width=1, border_color=GREEN_LINE, height=92,
         )
-        self._page_spin.pack(side=tk.LEFT, padx=2)
-        self._page_spin.set(1)
-        self._page_spin.bind("<Return>", lambda e: self._on_page_spin_change())
+        self._drop.pack(fill="x")
+        self._drop.pack_propagate(False)
 
-        self._total_pages_lbl = tk.Label(
-            nav_box, text="/ 0", font=("Segoe UI", 9), bg="#FFFFFF", fg="#64748B"
+        inner = ctk.CTkFrame(self._drop, fg_color="transparent")
+        inner.place(relx=0.5, rely=0.5, anchor="center")
+        self._drop_icon = ctk.CTkLabel(inner, text="📂", font=_font(22))
+        self._drop_icon.pack()
+        self._drop_title = ctk.CTkLabel(
+            inner, text="Klik untuk memilih file PDF",
+            font=_font(13, "bold"), text_color=TEXT,
         )
-        self._total_pages_lbl.pack(side=tk.LEFT, padx=(2, 6))
-
-        self._btn_next = tk.Button(
-            nav_box, text="Next ▶", font=("Segoe UI", 9, "bold"),
-            bg="#F1F5F9", fg="#1E293B", relief=tk.FLAT, padx=8, pady=3, cursor="hand2",
-            command=self._next_page,
+        self._drop_title.pack()
+        self._drop_sub = ctk.CTkLabel(
+            inner, text="Mushaf Al-Qur'an, Juz 1 sampai 30",
+            font=_font(11), text_color=MUTED,
         )
-        self._btn_next.pack(side=tk.LEFT, padx=2)
+        self._drop_sub.pack()
+        _bind_click(self._drop, self._pick_pdf)
 
-        # 2. Preview Canvas
-        self._preview_canvas = tk.Canvas(
-            parent, bg="#EEEDE9", highlightthickness=0, cursor="arrow"
+    def _build_style_card(self, parent):
+        body = self._card(parent, 2, "Gaya tracing")
+
+        row = ctk.CTkFrame(body, fg_color="transparent")
+        row.pack(fill="x")
+        row.grid_columnconfigure((0, 1), weight=1, uniform="model")
+
+        self._model_cards: dict[str, dict] = {}
+        models = [
+            ("gray", "Model A", "Light Gray", "Huruf jadi abu-abu tipis"),
+            ("outline", "Model B", "Outline", "Garis tepi tipis, isi putih"),
+        ]
+        for i, (key, cap, title, desc) in enumerate(models):
+            frame = ctk.CTkFrame(
+                row, corner_radius=12, border_width=2,
+                fg_color=CARD, border_color=BORDER,
+            )
+            frame.grid(row=0, column=i, sticky="nsew", padx=(0, 5) if i == 0 else (5, 0))
+
+            top = ctk.CTkFrame(frame, fg_color="transparent")
+            top.pack(fill="x", padx=12, pady=(10, 0))
+            ctk.CTkLabel(top, text=cap, font=_font(11), text_color=MUTED).pack(side="left")
+            mark = ctk.CTkLabel(top, text="○", font=_font(14, "bold"), text_color=MUTED)
+            mark.pack(side="right")
+            ctk.CTkLabel(
+                frame, text=title, font=_font(14, "bold"), text_color=TEXT, anchor="w",
+            ).pack(fill="x", padx=12)
+            ctk.CTkLabel(
+                frame, text=desc, font=_font(11), text_color=MUTED,
+                anchor="w", justify="left", wraplength=140,
+            ).pack(fill="x", padx=12, pady=(0, 10))
+
+            self._model_cards[key] = {"frame": frame, "mark": mark}
+            _bind_click(frame, lambda k=key: self._select_model(k))
+        self._refresh_model_cards()
+
+        # Kepekatan
+        head = ctk.CTkFrame(body, fg_color="transparent")
+        head.pack(fill="x", pady=(16, 0))
+        ctk.CTkLabel(
+            head, text="Kepekatan abu-abu", font=_font(12, "bold"), text_color=TEXT,
+        ).pack(side="left")
+        self._pct_lbl = ctk.CTkLabel(
+            head, text="", width=48, height=22, corner_radius=8,
+            fg_color=GREEN_SOFT, text_color=GREEN, font=_font(12, "bold"),
         )
-        self._preview_canvas.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-        self._preview_canvas.bind("<Configure>", self._on_canvas_resize)
-        self._preview_placeholder()
+        self._pct_lbl.pack(side="right")
 
-    def _setup_keybindings(self):
-        self.bind("<Left>", lambda e: self._prev_page())
-        self.bind("<Right>", lambda e: self._next_page())
+        steps = max(1, int(round((FADE_MAX - FADE_MIN) * 100)))
+        self._slider = ctk.CTkSlider(
+            body, from_=FADE_MIN, to=FADE_MAX, number_of_steps=steps,
+            progress_color=GREEN, button_color=GREEN, button_hover_color=GREEN_HOVER,
+            fg_color="#D5DED7", command=self._on_slider,
+        )
+        self._slider.set(self._opacity)
+        self._slider.pack(fill="x", pady=(8, 8))
 
-    # ── Logic & Handlers ────────────────────────────────────────────────────
+        chips = ctk.CTkFrame(body, fg_color="transparent")
+        chips.pack(fill="x")
+        chips.grid_columnconfigure((0, 1, 2), weight=1, uniform="chip")
+        self._chips: dict[str, ctk.CTkButton] = {}
+        for i, label in enumerate(FADE_PRESETS):
+            btn = ctk.CTkButton(
+                chips, text=label, height=28, corner_radius=14, font=_font(11),
+                fg_color=CHIP, hover_color=GREEN_SOFT, text_color=TEXT,
+                command=lambda lb=label: self._apply_preset(lb),
+            )
+            btn.grid(row=0, column=i, sticky="ew", padx=2)
+            self._chips[label] = btn
+        self._refresh_opacity_ui()
 
-    def _pick_pdf_dialog(self):
+    def _build_keep_card(self, parent):
+        body = self._card(parent, 3, "Tetap hitam pekat")
+        for text, var in [
+            ("Border ornamen halaman", self._keep_border),
+            ("Tanda waqf di margin", self._keep_waqf),
+            ("Nomor ayat dalam roset", self._keep_ayat),
+        ]:
+            ctk.CTkSwitch(
+                body, text=text, variable=var, font=_font(12), text_color=TEXT,
+                progress_color=GREEN, button_color="white", button_hover_color="#F0F0F0",
+                fg_color="#BCC8BF", switch_width=38, switch_height=20,
+                command=self._schedule_preview,
+            ).pack(anchor="w", pady=4)
+
+    def _build_action_card(self, parent):
+        card = ctk.CTkFrame(
+            parent, fg_color=CARD, corner_radius=14,
+            border_width=1, border_color=BORDER,
+        )
+        card.pack(side="bottom", fill="x", pady=(2, 0))
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=16, pady=14)
+
+        # Folder tujuan
+        row = ctk.CTkFrame(inner, fg_color="transparent")
+        row.pack(fill="x")
+        txt = ctk.CTkFrame(row, fg_color="transparent")
+        txt.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(
+            txt, text="Simpan hasil di", font=_font(11), text_color=MUTED, anchor="w",
+        ).pack(fill="x")
+        self._folder_lbl = ctk.CTkLabel(
+            txt, text="Sama dengan folder PDF", font=_font(12, "bold"),
+            text_color=TEXT, anchor="w",
+        )
+        self._folder_lbl.pack(fill="x")
+        self._filename_lbl = ctk.CTkLabel(
+            txt, text="", font=_font(11), text_color=GREEN, anchor="w",
+        )
+        self._filename_lbl.pack(fill="x")
+        ctk.CTkButton(
+            row, text="Ubah", width=64, height=30, corner_radius=8, font=_font(12, "bold"),
+            fg_color=CHIP, hover_color=GREEN_SOFT, text_color=TEXT,
+            command=self._pick_folder,
+        ).pack(side="right")
+
+        # Kualitas
+        self._quality = ctk.CTkSegmentedButton(
+            inner, values=["Cetak 300 DPI", "Draft 150 DPI"], variable=self._quality_var,
+            font=_font(12), selected_color=GREEN, selected_hover_color=GREEN_HOVER,
+            unselected_color=CHIP, unselected_hover_color=GREEN_SOFT,
+            text_color="white", fg_color=CHIP, height=30,
+            command=lambda _v: self._update_output_names(),
+        )
+        self._quality.pack(fill="x", pady=(12, 12))
+        self._quality_var.set("Cetak 300 DPI")
+
+        # Progres
+        self._progress_lbl = ctk.CTkLabel(
+            inner, text="", font=_font(11), text_color=MUTED, anchor="w",
+        )
+        self._progress_lbl.pack(fill="x")
+        self._progress = ctk.CTkProgressBar(
+            inner, height=8, corner_radius=4, progress_color=GREEN, fg_color="#D5DED7",
+        )
+        self._progress.set(0)
+        self._progress.pack(fill="x", pady=(2, 10))
+
+        self._btn_process = ctk.CTkButton(
+            inner, text="⚡  Proses & unduh semua halaman", height=46, corner_radius=12,
+            font=_font(14, "bold"), fg_color=DISABLED, hover_color=GREEN_HOVER,
+            text_color="white", text_color_disabled="white", state="disabled",
+            command=self._do_process,
+        )
+        self._btn_process.pack(fill="x")
+
+        self._btn_cancel = ctk.CTkButton(
+            inner, text="Batalkan proses", height=28, font=_font(12),
+            fg_color="transparent", hover_color="#FBEAE8", text_color=DANGER,
+            command=self._do_cancel,
+        )
+        # tombol batal baru dipasang saat proses berjalan
+
+    # ── Panel kanan (preview) ───────────────────────────────────────────────
+
+    def _build_preview(self, parent):
+        bar = ctk.CTkFrame(parent, fg_color="transparent")
+        bar.pack(fill="x", padx=16, pady=(14, 10))
+
+        self._mode_btn = ctk.CTkSegmentedButton(
+            bar, values=[MODE_TRACE, MODE_ORIG], font=_font(12, "bold"), height=32,
+            selected_color=GREEN, selected_hover_color=GREEN_HOVER,
+            unselected_color=CHIP, unselected_hover_color=GREEN_SOFT,
+            text_color="white", fg_color=CHIP,
+            command=self._on_mode,
+        )
+        self._mode_btn.pack(side="left")
+        self._mode_btn.set(MODE_TRACE)
+
+        self._busy_lbl = ctk.CTkLabel(
+            bar, text="", font=_font(11), text_color=MUTED,
+        )
+        self._busy_lbl.pack(side="left", padx=14)
+
+        ctk.CTkLabel(
+            bar, text="Scroll untuk zoom, seret untuk menggeser",
+            font=_font(11), text_color=MUTED,
+        ).pack(side="right")
+
+        holder = ctk.CTkFrame(parent, fg_color=PREVIEW_BG, corner_radius=12)
+        holder.pack(fill="both", expand=True, padx=16)
+        self._canvas = tk.Canvas(
+            holder, bg=PREVIEW_BG, highlightthickness=0, bd=0, cursor="arrow",
+        )
+        self._canvas.pack(fill="both", expand=True, padx=2, pady=2)
+        self._canvas.bind("<Configure>", lambda e: self._render_canvas())
+        self._canvas.bind("<MouseWheel>", self._on_wheel)
+        self._canvas.bind("<ButtonPress-1>", self._on_drag_start)
+        self._canvas.bind("<B1-Motion>", self._on_drag)
+        self._canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag_from", None))
+        self._canvas.bind("<Double-Button-1>", lambda e: self._zoom_fit())
+
+        nav = ctk.CTkFrame(parent, fg_color="transparent")
+        nav.pack(fill="x", padx=16, pady=12)
+
+        pager = ctk.CTkFrame(nav, fg_color="transparent")
+        pager.pack(side="left")
+        self._btn_prev = self._small_btn(pager, "◀", self._prev_page)
+        self._btn_prev.pack(side="left")
+        ctk.CTkLabel(pager, text="Hal", font=_font(12), text_color=MUTED).pack(side="left", padx=(10, 6))
+        self._page_entry = ctk.CTkEntry(
+            pager, width=52, height=32, justify="center", font=_font(12, "bold"),
+            fg_color=CARD, border_color=BORDER, text_color=TEXT,
+        )
+        self._page_entry.pack(side="left")
+        self._page_entry.insert(0, "0")
+        self._page_entry.bind("<Return>", lambda e: self._goto_page_from_entry())
+        self._page_entry.bind("<FocusOut>", lambda e: self._sync_page_entry())
+        self._total_lbl = ctk.CTkLabel(pager, text="/ 0", font=_font(12), text_color=MUTED)
+        self._total_lbl.pack(side="left", padx=(6, 10))
+        self._btn_next = self._small_btn(pager, "▶", self._next_page)
+        self._btn_next.pack(side="left")
+
+        zoom = ctk.CTkFrame(nav, fg_color="transparent")
+        zoom.pack(side="right")
+        self._small_btn(zoom, "−", lambda: self._zoom_by(1 / 1.25)).pack(side="left")
+        self._zoom_lbl = ctk.CTkLabel(
+            zoom, text="100%", width=54, font=_font(12, "bold"), text_color=TEXT,
+        )
+        self._zoom_lbl.pack(side="left")
+        self._small_btn(zoom, "+", lambda: self._zoom_by(1.25)).pack(side="left")
+        ctk.CTkButton(
+            zoom, text="Pas layar", width=76, height=32, corner_radius=8, font=_font(12),
+            fg_color=CHIP, hover_color=GREEN_SOFT, text_color=TEXT,
+            command=self._zoom_fit,
+        ).pack(side="left", padx=(8, 0))
+
+    def _small_btn(self, parent, text, command):
+        return ctk.CTkButton(
+            parent, text=text, width=36, height=32, corner_radius=8, font=_font(13, "bold"),
+            fg_color=CHIP, hover_color=GREEN_SOFT, text_color=TEXT, command=command,
+        )
+
+    def _bind_keys(self):
+        self.bind("<Left>", lambda e: None if self._typing() else self._prev_page())
+        self.bind("<Right>", lambda e: None if self._typing() else self._next_page())
+        self.bind("<space>", lambda e: None if self._typing() else self._toggle_mode())
+
+    def _typing(self) -> bool:
+        try:
+            w = self.focus_get()
+            return w is not None and w.winfo_class() in ("Entry", "TEntry", "Text")
+        except Exception:
+            return False
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Pilihan & pengaturan
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _select_model(self, key: str):
+        if key == self._model:
+            return
+        self._model = key
+        self._refresh_model_cards()
+        self._schedule_preview()
+
+    def _refresh_model_cards(self):
+        for key, parts in self._model_cards.items():
+            active = key == self._model
+            parts["frame"].configure(
+                border_color=GREEN if active else BORDER,
+                fg_color=GREEN_SOFT if active else CARD,
+            )
+            parts["mark"].configure(
+                text="✓" if active else "○",
+                text_color=GREEN if active else MUTED,
+            )
+
+    def _on_slider(self, value):
+        self._opacity = float(value)
+        self._refresh_opacity_ui()
+        self._schedule_preview()
+
+    def _apply_preset(self, label: str):
+        self._opacity = float(FADE_PRESETS[label])
+        self._slider.set(self._opacity)
+        self._refresh_opacity_ui()
+        self._schedule_preview()
+
+    def _refresh_opacity_ui(self):
+        self._pct_lbl.configure(text=f"{int(round(self._opacity * 100))}%")
+        for label, btn in self._chips.items():
+            active = abs(FADE_PRESETS[label] - self._opacity) < 0.005
+            btn.configure(
+                fg_color=GREEN if active else CHIP,
+                text_color="white" if active else TEXT,
+                hover_color=GREEN_HOVER if active else GREEN_SOFT,
+            )
+
+    def _set_status(self, msg: str):
+        self._status.configure(text=msg)
+
+    def _set_pill(self, text: str, bg: str, fg: str):
+        self._pill.configure(text=f"  ●  {text}  ", fg_color=bg, text_color=fg)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # File & folder
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _pick_pdf(self):
+        if self._processing:
+            return
         path = filedialog.askopenfilename(
-            title="Pilih File Al-Qur'an PDF",
-            filetypes=[("PDF files", "*.pdf"), ("Semua File", "*.*")],
+            title="Pilih file PDF Al-Qur'an",
+            filetypes=[("File PDF", "*.pdf"), ("Semua file", "*.*")],
         )
         if path:
             self._load_pdf(path)
 
-    def _pick_folder_dialog(self):
+    def _pick_folder(self):
         initial = str(self._output_folder) if self._output_folder else ""
-        folder = filedialog.askdirectory(title="Pilih Folder Penyimpanan Output", initialdir=initial)
+        folder = filedialog.askdirectory(title="Pilih folder penyimpanan", initialdir=initial)
         if folder:
             self._output_folder = Path(folder)
-            self._folder_label.config(text=f"Folder: {self._output_folder}")
-            self._update_output_preview()
+            self._update_output_names()
 
     def _load_pdf(self, path: str):
         try:
             doc = open_pdf(path)
-            self._total_pages = page_count(doc)
+            total = page_count(doc)
             doc.close()
         except Exception as e:
-            messagebox.showerror("Gagal Membuka File", f"File PDF tidak valid:\n{e}")
+            messagebox.showerror("Gagal membuka file", f"File PDF tidak valid:\n{e}")
             return
 
-        self._pdf_path = path
         p = Path(path)
+        self._pdf_path = path
+        self._total_pages = total
+        self._page = 0
+        self._trace_img = None
+        self._orig_img = None
+        self._orig_page = -1
+        self._zoom_fit(render=False)
 
-        # Update card file
         size_mb = p.stat().st_size / (1024 * 1024)
-        self._file_name_lbl.config(text=f"✓ {p.name}")
-        self._file_meta_lbl.config(text=f"{self._total_pages} Halaman  •  {size_mb:.1f} MB")
-        self._file_card.pack(fill=tk.X, padx=14, pady=(0, 6), after=self._upload_box)
-        self._upload_hint.config(text="File siap diproses")
-        self._btn_pick_file.config(text="🔄 Ganti File PDF...")
+        self._drop_icon.configure(text="📄")
+        self._drop_title.configure(text=_shorten(p.name, 34))
+        self._drop_sub.configure(text=f"{total} halaman  •  {size_mb:.1f} MB  •  klik untuk ganti")
+        self._drop.configure(fg_color="#DCEFE3", border_color=GREEN)
 
-        # Update pagination
-        self._preview_page_num = 0
-        self._page_spin.config(to=self._total_pages)
-        self._page_spin.set(1)
-        self._total_pages_lbl.config(text=f"/ {self._total_pages}")
-
-        # Update folder output default
         if self._output_folder is None:
             self._output_folder = p.parent
-            self._folder_label.config(text=f"Folder: {self._output_folder}")
-
-        self._update_output_preview()
+        self._sync_page_entry()
+        self._total_lbl.configure(text=f"/ {total}")
+        self._update_output_names()
+        self._set_process_enabled(True)
         self.title(f"Trace Qur'an - {p.name}")
-        self._status(f"File {p.name} dimuat ({self._total_pages} halaman). Memuat preview...")
+        self._set_status(f"{p.name} dimuat ({total} halaman). Memuat preview...")
         self._do_preview()
 
-    def _update_output_preview(self):
+    def _output_path(self) -> Path | None:
+        if not self._pdf_path:
+            return None
+        p = Path(self._pdf_path)
+        suffix = "_trace_outline.pdf" if self._model == "outline" else "_trace.pdf"
+        return (self._output_folder or p.parent) / f"{p.stem}{suffix}"
+
+    def _update_output_names(self):
+        out = self._output_path()
+        if out is None:
+            return
+        self._folder_lbl.configure(text=_shorten(str(out.parent), 38))
+        self._filename_lbl.configure(text=_shorten(out.name, 44))
+        dpi = self._current_dpi()
+        self._btn_process.configure(
+            text=f"⚡  Proses & unduh semua halaman ({dpi} DPI)"
+        )
+
+    def _current_dpi(self) -> int:
+        return DPI_PRINT if "300" in self._quality_var.get() else DPI_DRAFT
+
+    def _set_process_enabled(self, enabled: bool):
+        self._btn_process.configure(
+            state="normal" if enabled else "disabled",
+            fg_color=GREEN if enabled else DISABLED,
+        )
+
+    def _reset(self):
+        if self._processing:
+            return
+        self._pdf_path = None
+        self._total_pages = 0
+        self._page = 0
+        self._trace_img = None
+        self._orig_img = None
+        self._orig_page = -1
+        self._preview_req += 1
+        self._output_folder = None
+        self._zoom_fit(render=False)
+
+        self._drop_icon.configure(text="📂")
+        self._drop_title.configure(text="Klik untuk memilih file PDF")
+        self._drop_sub.configure(text="Mushaf Al-Qur'an, Juz 1 sampai 30")
+        self._drop.configure(fg_color=GREEN_SOFT, border_color=GREEN_LINE)
+        self._folder_lbl.configure(text="Sama dengan folder PDF")
+        self._filename_lbl.configure(text="")
+        self._btn_process.configure(text="⚡  Proses & unduh semua halaman")
+        self._set_process_enabled(False)
+        self._progress.set(0)
+        self._progress_lbl.configure(text="")
+        self._sync_page_entry()
+        self._total_lbl.configure(text="/ 0")
+        self._busy_lbl.configure(text="")
+        self.title("Trace Qur'an - Duta Ilmu")
+        self._set_status("Pilih file PDF mushaf untuk memulai.")
+        self._render_canvas()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Preview
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _on_mode(self, value: str):
+        self._preview_mode = "trace" if value == MODE_TRACE else "original"
+        self._render_canvas()
+
+    def _toggle_mode(self):
         if not self._pdf_path:
             return
-        p = Path(self._pdf_path)
-        stem = p.stem
-        model_suffix = "_trace_outline.pdf" if self._model_var.get() == "outline" else "_trace.pdf"
-        out_name = f"{stem}{model_suffix}"
-        self._filename_label.config(text=f"Nama File: {out_name}")
-
-    def _set_preview_mode(self, mode: str):
-        self._preview_mode = mode
-        if mode == "trace":
-            self._btn_mode_trace.config(bg="#198754", fg="#FFFFFF")
-            self._btn_mode_orig.config(bg="#F1F5F9", fg="#475569")
-            if self._last_trace_img:
-                self._show_pil_in_canvas(self._last_trace_img)
-            else:
-                self._do_preview()
-        else:
-            self._btn_mode_orig.config(bg="#198754", fg="#FFFFFF")
-            self._btn_mode_trace.config(bg="#F1F5F9", fg="#475569")
-            if self._last_orig_img:
-                self._show_pil_in_canvas(self._last_orig_img)
-            else:
-                self._do_preview()
+        new = MODE_ORIG if self._preview_mode == "trace" else MODE_TRACE
+        self._mode_btn.set(new)
+        self._on_mode(new)
 
     def _prev_page(self):
-        if not self._pdf_path or self._preview_page_num <= 0:
-            return
-        self._preview_page_num -= 1
-        self._page_spin.set(self._preview_page_num + 1)
-        self._do_preview()
+        if self._pdf_path and self._page > 0:
+            self._page -= 1
+            self._sync_page_entry()
+            self._do_preview()
 
     def _next_page(self):
-        if not self._pdf_path or self._preview_page_num >= self._total_pages - 1:
+        if self._pdf_path and self._page < self._total_pages - 1:
+            self._page += 1
+            self._sync_page_entry()
+            self._do_preview()
+
+    def _goto_page_from_entry(self):
+        if not self._pdf_path:
             return
-        self._preview_page_num += 1
-        self._page_spin.set(self._preview_page_num + 1)
-        self._do_preview()
-
-    def _on_page_spin_change(self):
         try:
-            n = int(self._page_spin.get()) - 1
-            n = max(0, min(n, self._total_pages - 1))
-            if n != self._preview_page_num:
-                self._preview_page_num = n
-                self._do_preview()
+            n = int(self._page_entry.get()) - 1
         except ValueError:
-            pass
+            self._sync_page_entry()
+            return
+        n = max(0, min(n, self._total_pages - 1))
+        if n != self._page:
+            self._page = n
+            self._do_preview()
+        self._sync_page_entry()
+        self.focus_set()
 
-    def _on_preset_change(self, *_):
-        preset = self._fade_preset.get()
-        if preset in FADE_PRESETS:
-            self._opacity_var.set(FADE_PRESETS[preset])
-            self._slider_pct_label.config(text=f"{int(FADE_PRESETS[preset]*100)}%")
-            self._schedule_preview()
-
-    def _on_slider_move(self, val):
-        pct = int(float(val) * 100)
-        self._slider_pct_label.config(text=f"{pct}%")
+    def _sync_page_entry(self):
+        self._page_entry.delete(0, "end")
+        self._page_entry.insert(0, str(self._page + 1 if self._pdf_path else 0))
 
     def _schedule_preview(self):
-        self._update_output_preview()
+        self._update_output_names()
         if self._preview_timer is not None:
             self.after_cancel(self._preview_timer)
-        self._preview_timer = self.after(250, self._do_preview)
+        self._preview_timer = self.after(300, self._do_preview)
 
     def _do_preview(self):
         if not self._pdf_path or self._processing:
             return
-        self._status(f"Merender preview halaman {self._preview_page_num + 1}...")
+        self._preview_req += 1
+        token = self._preview_req
+
+        # Ambil semua nilai di thread utama, lalu kirim ke thread kerja.
+        path = self._pdf_path
+        page = self._page
+        model = self._model
+        opacity = self._opacity
+        keep_waqf = self._keep_waqf.get()
+        keep_ayat = self._keep_ayat.get()
+        need_orig = self._orig_page != page or self._orig_img is None
+
+        self._busy_lbl.configure(text="Merender preview...")
+        self._set_status(f"Merender halaman {page + 1}...")
 
         def _run():
             try:
-                # Render gambar asli untuk tab "Gambar Asli"
-                doc = open_pdf(self._pdf_path)
-                orig_img = render_page(doc, self._preview_page_num, dpi=DPI_PREVIEW)
-                doc.close()
-                self._last_orig_img = orig_img
-
-                # Render gambar hasil trace
-                trace_img = preview_page(
-                    self._pdf_path,
-                    page_num=self._preview_page_num,
-                    model=self._model_var.get(),
-                    opacity=self._opacity_var.get(),
-                    keep_waqf=self._keep_waqf.get(),
-                    keep_ayat=self._keep_ayat.get(),
-                    dpi=DPI_PREVIEW,
+                orig = None
+                if need_orig:
+                    doc = open_pdf(path)
+                    orig = render_page(doc, page, dpi=DPI_PREVIEW)
+                    doc.close()
+                trace = preview_page(
+                    path, page_num=page, model=model, opacity=opacity,
+                    keep_waqf=keep_waqf, keep_ayat=keep_ayat, dpi=DPI_PREVIEW,
                 )
-                self._last_trace_img = trace_img
-
-                def _update_ui():
-                    target = trace_img if self._preview_mode == "trace" else orig_img
-                    self._show_pil_in_canvas(target)
-                    self._status(f"Preview halaman {self._preview_page_num + 1} siap.")
-
-                self.after(0, _update_ui)
             except Exception as e:
-                self.after(0, lambda: self._status(f"Error preview: {e}"))
+                err = str(e)
+                self.after(0, lambda: self._on_preview_error(token, err))
+                return
+            self.after(0, lambda: self._on_preview_ready(token, page, orig, trace))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _show_pil_in_canvas(self, img: Image.Image):
-        canvas = self._preview_canvas
-        cw = canvas.winfo_width() or 600
-        ch = canvas.winfo_height() or 650
+    def _on_preview_ready(self, token, page, orig, trace):
+        if token != self._preview_req:
+            return  # hasil usang, sudah ada permintaan yang lebih baru
+        if orig is not None:
+            self._orig_img = orig
+            self._orig_page = page
+        self._trace_img = trace
+        self._busy_lbl.configure(text="")
+        self._set_status(f"Preview halaman {page + 1} siap.")
+        self._render_canvas()
+
+    def _on_preview_error(self, token, msg):
+        if token != self._preview_req:
+            return
+        self._busy_lbl.configure(text="")
+        self._set_status(f"Gagal membuat preview: {msg}")
+
+    # ── Kanvas, zoom, geser ─────────────────────────────────────────────────
+
+    def _current_image(self) -> Image.Image | None:
+        return self._trace_img if self._preview_mode == "trace" else self._orig_img
+
+    def _render_canvas(self):
+        c = self._canvas
+        c.delete("all")
+        cw, ch = c.winfo_width(), c.winfo_height()
+        if cw < 20 or ch < 20:
+            return
+
+        img = self._current_image()
+        if img is None:
+            self._draw_empty(cw, ch)
+            return
 
         iw, ih = img.size
-        scale = min((cw - 24) / iw, (ch - 24) / ih, 1.0)
+        fit = min((cw - 40) / iw, (ch - 40) / ih)
+        scale = fit * self._zoom
         nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
-        thumb = img.resize((nw, nh), Image.LANCZOS)
 
-        tk_img = ImageTk.PhotoImage(thumb)
-        canvas.delete("all")
-        canvas.create_image(cw // 2, ch // 2, anchor=tk.CENTER, image=tk_img)
-        canvas._tk_img = tk_img
+        key = (id(img), nw, nh)
+        if key != self._photo_key:
+            self._photo = ImageTk.PhotoImage(img.resize((nw, nh), Image.LANCZOS))
+            self._photo_key = key
 
-    def _preview_placeholder(self):
-        self._preview_canvas.delete("all")
-        w = self._preview_canvas.winfo_width() or 600
-        h = self._preview_canvas.winfo_height() or 650
-        self._preview_canvas.create_text(
-            w // 2, h // 2,
-            text="Silakan pilih file PDF Mushaf Al-Qur'an untuk melihat preview halaman.",
-            fill="#94A3B8", font=("Segoe UI", 11),
+        max_x = max(0.0, (nw - cw) / 2) + 60
+        max_y = max(0.0, (nh - ch) / 2) + 60
+        self._pan_x = max(-max_x, min(max_x, self._pan_x))
+        self._pan_y = max(-max_y, min(max_y, self._pan_y))
+        x, y = cw / 2 + self._pan_x, ch / 2 + self._pan_y
+
+        c.create_rectangle(
+            x - nw / 2 + 4, y - nh / 2 + 5, x + nw / 2 + 4, y + nh / 2 + 5,
+            fill="#C9D0C8", outline="",
+        )
+        c.create_image(x, y, image=self._photo, anchor="center")
+        c.configure(cursor="fleur" if self._zoom > 1.001 else "arrow")
+        self._zoom_lbl.configure(text=f"{int(round(self._zoom * 100))}%")
+
+    def _draw_empty(self, cw, ch):
+        c = self._canvas
+        if self._pdf_path:
+            c.create_text(
+                cw / 2, ch / 2, text="Merender preview...",
+                fill=MUTED, font=(FONT, 12),
+            )
+            return
+        c.create_text(cw / 2, ch / 2 - 46, text="📖", font=(FONT, 34))
+        c.create_text(
+            cw / 2, ch / 2 + 2, text="Belum ada dokumen",
+            fill=TEXT, font=(FONT, 14, "bold"),
+        )
+        c.create_text(
+            cw / 2, ch / 2 + 30,
+            text="Pilih file PDF di panel kiri.\nHasil tracing akan tampil di sini.",
+            fill=MUTED, font=(FONT, 11), justify="center",
         )
 
-    def _on_canvas_resize(self, event):
-        img = self._last_trace_img if self._preview_mode == "trace" else self._last_orig_img
-        if img:
-            self._show_pil_in_canvas(img)
+    def _zoom_by(self, factor: float):
+        self._zoom = max(1.0, min(5.0, self._zoom * factor))
+        if self._zoom <= 1.0:
+            self._pan_x = self._pan_y = 0.0
+        self._render_canvas()
 
-    # ── Eksekusi & Notifikasi Lengkap ────────────────────────────────────────
+    def _zoom_fit(self, render: bool = True):
+        self._zoom = 1.0
+        self._pan_x = self._pan_y = 0.0
+        if render:
+            self._render_canvas()
+
+    def _on_wheel(self, event):
+        if self._current_image() is None:
+            return
+        self._zoom_by(1.15 if event.delta > 0 else 1 / 1.15)
+
+    def _on_drag_start(self, event):
+        self._drag_from = (event.x, event.y)
+
+    def _on_drag(self, event):
+        if self._drag_from is None or self._zoom <= 1.001:
+            return
+        dx, dy = event.x - self._drag_from[0], event.y - self._drag_from[1]
+        self._drag_from = (event.x, event.y)
+        self._pan_x += dx
+        self._pan_y += dy
+        self._render_canvas()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Proses
+    # ══════════════════════════════════════════════════════════════════════
 
     def _do_process(self):
         if not self._pdf_path:
-            messagebox.showwarning("File Belum Dipilih", "Silakan pilih file PDF Al-Qur'an terlebih dahulu.")
+            messagebox.showwarning("File belum dipilih", "Pilih file PDF Al-Qur'an terlebih dahulu.")
             return
         if self._processing:
             return
 
-        p = Path(self._pdf_path)
-        model = self._model_var.get()
-        model_suffix = "_trace_outline.pdf" if model == "outline" else "_trace.pdf"
-        out_folder = self._output_folder or p.parent
-        out_path = out_folder / f"{p.stem}{model_suffix}"
+        out_path = self._output_path()
+        dpi = self._current_dpi()
+        self._last_dpi = dpi
 
-        dpi = DPI_PRINT if "300" in self._dpi_var.get() else DPI_DRAFT
+        # Ambil semua nilai di thread utama
+        path = self._pdf_path
+        model = self._model
+        opacity = self._opacity
+        keep_border = self._keep_border.get()
+        keep_waqf = self._keep_waqf.get()
+        keep_ayat = self._keep_ayat.get()
+
         self._processing = True
         self._cancel_flag[0] = False
-        self._btn_process.config(state=tk.DISABLED, bg="#94A3B8")
-        self._btn_cancel.config(state=tk.NORMAL)
-        self._progress_var.set(0)
-        self._progress_label_var.set(f"Memproses 0 dari {self._total_pages} halaman...")
-        self._status("Proses dimulai...")
+        self._set_process_enabled(False)
+        self._btn_process.configure(text="Sedang memproses...")
+        self._btn_cancel.pack(fill="x", pady=(6, 0))
+        self._progress.set(0)
+        self._progress_lbl.configure(text=f"Memproses 0 dari {self._total_pages} halaman...")
+        self._set_pill("Memproses", "#5A4A12", "#FFD970")
+        self._set_status("Proses dimulai...")
 
         def _run():
             try:
                 result = process_pdf(
-                    self._pdf_path,
+                    path,
                     output_path=out_path,
                     model=model,
-                    opacity=self._opacity_var.get(),
-                    keep_border=self._keep_border.get(),
-                    keep_waqf=self._keep_waqf.get(),
-                    keep_ayat=self._keep_ayat.get(),
+                    opacity=opacity,
+                    keep_border=keep_border,
+                    keep_waqf=keep_waqf,
+                    keep_ayat=keep_ayat,
                     dpi=dpi,
                     progress_callback=self._on_progress,
                     cancel_flag=self._cancel_flag,
                 )
-                self.after(0, lambda: self._on_process_done(result))
+                self.after(0, lambda: self._on_done(result))
             except InterruptedError:
-                self.after(0, self._on_process_cancelled)
+                self.after(0, self._on_cancelled)
             except Exception as e:
-                self.after(0, lambda: self._on_process_error(str(e)))
+                err = str(e)
+                self.after(0, lambda: self._on_error(err))
 
         threading.Thread(target=_run, daemon=True).start()
 
     def _on_progress(self, done: int, total: int):
-        pct = done / total * 100
-        self.after(0, lambda: self._progress_var.set(pct))
-        self.after(0, lambda: self._progress_label_var.set(
-            f"Memproses halaman {done} dari {total} ({int(pct)}%)..."
-        ))
-        self.after(0, lambda: self._status(f"Sedang memproses halaman {done}/{total}..."))
+        frac = done / total if total else 0
 
-    def _on_process_done(self, result_path: Path):
+        def _ui():
+            self._progress.set(frac)
+            self._progress_lbl.configure(
+                text=f"Memproses halaman {done} dari {total} ({int(frac * 100)}%)"
+            )
+            self._set_status(f"Sedang memproses halaman {done}/{total}...")
+
+        self.after(0, _ui)
+
+    def _finish_ui(self):
         self._processing = False
-        self._btn_process.config(state=tk.NORMAL, bg="#198754")
-        self._btn_cancel.config(state=tk.DISABLED)
-        self._progress_var.set(100)
-        self._progress_label_var.set(f"Selesai! {self._total_pages} halaman berhasil diproses.")
-        self._status(f"Selesai tersimpan di: {result_path.name}")
+        self._btn_cancel.pack_forget()
+        self._set_process_enabled(True)
+        self._update_output_names()
+        self._set_pill("Siap digunakan", "#24503D", "#9FE3BA")
 
-        # Bunyikan notifikasi lonceng sistem
+    def _on_done(self, result_path: Path):
+        self._finish_ui()
+        self._progress.set(1)
+        self._progress_lbl.configure(text=f"Selesai. {self._total_pages} halaman berhasil diproses.")
+        self._set_status(f"Tersimpan: {Path(result_path).name}")
         try:
             self.bell()
         except Exception:
             pass
+        self._show_success(Path(result_path))
 
-        # Tampilkan Modal Pop-up Sukses yang Jelas
-        self._show_success_modal(result_path)
+    def _on_cancelled(self):
+        self._finish_ui()
+        self._progress.set(0)
+        self._progress_lbl.configure(text="Proses dibatalkan.")
+        self._set_status("Proses dibatalkan.")
 
-    def _show_success_modal(self, result_path: Path):
-        dlg = tk.Toplevel(self)
-        dlg.title("🎉 Tracing Selesai - Duta Ilmu")
-        dlg.geometry("520x360")
-        dlg.resizable(False, False)
-        dlg.configure(bg="#FFFFFF")
-        dlg.transient(self)
-        dlg.grab_set()
-
-        # Center modal
-        dlg.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - 520) // 2
-        y = self.winfo_y() + (self.winfo_height() - 360) // 2
-        dlg.geometry(f"+{x}+{y}")
-
-        content = tk.Frame(dlg, bg="#FFFFFF", padx=24, pady=20)
-        content.pack(fill=tk.BOTH, expand=True)
-
-        # Header Icon & Title
-        tk.Label(content, text="🎉", font=("Segoe UI", 32), bg="#FFFFFF").pack()
-        tk.Label(
-            content, text="PROSES SELESAI!",
-            font=("Segoe UI", 16, "bold"), bg="#FFFFFF", fg="#198754",
-        ).pack(pady=(4, 2))
-
-        tk.Label(
-            content,
-            text=f"Seluruh {self._total_pages} halaman berhasil diproses dengan kualitas cetak 300 DPI.",
-            font=("Segoe UI", 10), bg="#FFFFFF", fg="#475569",
-        ).pack(pady=(0, 14))
-
-        # File Info Card
-        info_card = tk.Frame(content, bg="#F8FAFC", highlightthickness=1, highlightbackground="#E2E8F0", padx=12, pady=10)
-        info_card.pack(fill=tk.X, pady=(0, 16))
-
-        tk.Label(
-            info_card, text=f"📄 File: {result_path.name}",
-            font=("Segoe UI", 9, "bold"), bg="#F8FAFC", fg="#0F172A", anchor="w",
-        ).pack(fill=tk.X)
-
-        tk.Label(
-            info_card, text=f"📁 Folder: {result_path.parent}",
-            font=("Segoe UI", 8), bg="#F8FAFC", fg="#64748B", anchor="w", wraplength=450, justify=tk.LEFT,
-        ).pack(fill=tk.X, pady=(2, 0))
-
-        # Tombol Aksi Langsung
-        btn_box = tk.Frame(content, bg="#FFFFFF")
-        btn_box.pack(fill=tk.X)
-
-        def _open_pdf():
-            try:
-                os.startfile(str(result_path))
-            except Exception as e:
-                messagebox.showerror("Error", f"Gagal membuka PDF:\n{e}")
-
-        def _open_folder():
-            try:
-                os.startfile(str(result_path.parent))
-            except Exception as e:
-                messagebox.showerror("Error", f"Gagal membuka folder:\n{e}")
-
-        btn_open_file = tk.Button(
-            btn_box, text="📄 Buka File PDF", command=_open_pdf,
-            font=("Segoe UI", 10, "bold"), bg="#198754", fg="#FFFFFF",
-            relief=tk.FLAT, cursor="hand2", padx=14, pady=8,
-        )
-        btn_open_file.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-
-        btn_open_dir = tk.Button(
-            btn_box, text="📁 Buka Folder", command=_open_folder,
-            font=("Segoe UI", 10, "bold"), bg="#0D6EFD", fg="#FFFFFF",
-            relief=tk.FLAT, cursor="hand2", padx=14, pady=8,
-        )
-        btn_open_dir.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-
-        btn_close = tk.Button(
-            btn_box, text="Tutup", command=dlg.destroy,
-            font=("Segoe UI", 10), bg="#E2E8F0", fg="#334155",
-            relief=tk.FLAT, cursor="hand2", padx=14, pady=8,
-        )
-        btn_close.pack(side=tk.LEFT, fill=tk.X)
-
-    def _on_process_cancelled(self):
-        self._processing = False
-        self._btn_process.config(state=tk.NORMAL, bg="#198754")
-        self._btn_cancel.config(state=tk.DISABLED)
-        self._progress_label_var.set("Proses dibatalkan.")
-        self._status("Proses dibatalkan oleh pengguna.")
-
-    def _on_process_error(self, msg: str):
-        self._processing = False
-        self._btn_process.config(state=tk.NORMAL, bg="#198754")
-        self._btn_cancel.config(state=tk.DISABLED)
-        self._status(f"Error: {msg}")
-        messagebox.showerror("Gagal Memproses", f"Terjadi kesalahan saat memproses:\n{msg}")
+    def _on_error(self, msg: str):
+        self._finish_ui()
+        self._set_status(f"Gagal: {msg}")
+        messagebox.showerror("Gagal memproses", f"Terjadi kesalahan saat memproses:\n{msg}")
 
     def _do_cancel(self):
         self._cancel_flag[0] = True
-        self._status("Membatalkan proses...")
+        self._btn_cancel.configure(state="disabled")
+        self._set_status("Membatalkan proses...")
 
-    def _status(self, msg: str):
-        self._status_var.set(msg)
+    # ── Dialog sukses ───────────────────────────────────────────────────────
 
+    def _show_success(self, result_path: Path):
+        w, h = 500, 330
+        dlg = ctk.CTkToplevel(self, fg_color=CARD)
+        dlg.title("Tracing selesai")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        x = self.winfo_x() + (self.winfo_width() - w) // 2
+        y = self.winfo_y() + (self.winfo_height() - h) // 2
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+        dlg.after(150, lambda: (dlg.lift(), dlg.grab_set()))
 
-# ── Widget Styling Helpers ──────────────────────────────────────────────────
+        ctk.CTkLabel(
+            dlg, text="✓", width=56, height=56, corner_radius=28,
+            fg_color=GREEN_SOFT, text_color=GREEN, font=_font(28, "bold"),
+        ).pack(pady=(26, 10))
+        ctk.CTkLabel(
+            dlg, text="Tracing selesai", font=_font(19, "bold"), text_color=TEXT,
+        ).pack()
+        ctk.CTkLabel(
+            dlg,
+            text=f"{self._total_pages} halaman diproses dengan kualitas {self._last_dpi} DPI.",
+            font=_font(12), text_color=MUTED,
+        ).pack(pady=(2, 14))
 
-def _section_header(parent, text: str):
-    tk.Label(
-        parent, text=text,
-        font=("Segoe UI", 9, "bold"),
-        bg="#FFFFFF", fg="#0F5132",
-        anchor="w", padx=14,
-    ).pack(fill=tk.X, pady=(6, 4))
+        info = ctk.CTkFrame(dlg, fg_color="#F6F8F6", corner_radius=10, border_width=1, border_color=BORDER)
+        info.pack(fill="x", padx=28)
+        ctk.CTkLabel(
+            info, text=_shorten(result_path.name, 52), font=_font(12, "bold"),
+            text_color=TEXT, anchor="w",
+        ).pack(fill="x", padx=14, pady=(10, 0))
+        ctk.CTkLabel(
+            info, text=_shorten(str(result_path.parent), 60), font=_font(11),
+            text_color=MUTED, anchor="w",
+        ).pack(fill="x", padx=14, pady=(0, 10))
 
+        def _open(target: Path):
+            try:
+                os.startfile(str(target))  # Windows
+            except Exception as e:
+                messagebox.showerror("Gagal membuka", str(e), parent=dlg)
 
-def _divider(parent):
-    tk.Frame(parent, bg="#E2E8F0", height=1).pack(fill=tk.X, pady=8, padx=14)
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(fill="x", padx=28, pady=20)
+        btns.grid_columnconfigure((0, 1), weight=1, uniform="b")
+        ctk.CTkButton(
+            btns, text="Buka PDF", height=40, corner_radius=10, font=_font(13, "bold"),
+            fg_color=GREEN, hover_color=GREEN_HOVER,
+            command=lambda: _open(result_path),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        ctk.CTkButton(
+            btns, text="Buka folder", height=40, corner_radius=10, font=_font(13, "bold"),
+            fg_color=CHIP, hover_color=GREEN_SOFT, text_color=TEXT,
+            command=lambda: _open(result_path.parent),
+        ).grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        ctk.CTkButton(
+            dlg, text="Tutup", height=28, font=_font(12), fg_color="transparent",
+            hover_color=CHIP, text_color=MUTED, command=dlg.destroy,
+        ).pack()
