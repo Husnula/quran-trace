@@ -1,0 +1,4 @@
+# Cloudflare Pages build config
+# Root directory: web
+# Build command: npm install && npm run build
+# Output directory: out

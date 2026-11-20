@@ -1,0 +1,37 @@
+@import "tailwindcss";
+
+@theme {
+  /* Forest Green design system */
+  --color-accent:        #2D6A4F;
+  --color-accent-hover:  #245C42;
+  --color-accent-light:  #D8F3DC;
+  --color-accent-muted:  #52B788;
+
+  --color-bg-base:       #F7F7F5;
+  --color-bg-panel:      #FFFFFF;
+  --color-bg-sunken:     #EEEDE9;
+
+  --color-border-subtle: #DDDBD5;
+  --color-border-strong: #B8B5AE;
+
+  --color-text-primary:   #1C1917;
+  --color-text-secondary: #57534E;
+  --color-text-muted:     #A8A29E;
+  --color-text-inverse:   #FAFAF9;
+
+  --color-error:    #C0392B;
+  --color-error-bg: #FEF0EF;
+
+  --font-sans: "Geist", "Segoe UI", system-ui, sans-serif;
+}
+
+html {
+  background-color: var(--color-bg-base);
+  color: var(--color-text-primary);
+}
+
+/* Smooth scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-strong) transparent;
+}

@@ -34,6 +34,14 @@ desktop.ini
 test_output/
 scratch/
 
+# Node / Next.js
+node_modules/
+.next/
+out/
+web/out/
+web/.next/
+web/node_modules/
+
 # Large sample PDFs (users bring their own)
 *.pdf
 !sample/*.pdf
