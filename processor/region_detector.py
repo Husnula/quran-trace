@@ -1,13 +1,12 @@
 """
 processor/region_detector.py
-Deteksi area border ornamen dan zona teks aman.
+Deteksi grid slot baris ayat, border ornamen, dan margin mushaf.
 
-Strategi untuk mushaf Utsmani (JUZ 1 & 2 dari Duta Ilmu):
-- Halaman berbentuk portrait dengan border ornamen di kiri dan kanan
-- Border berupa pola garis tebal + ornamen dekoratif
-- Area teks aman = rectangle di dalam border
-- Pendekatan: cari garis vertikal tebal di kiri dan kanan,
-  ambil ruang di antara keduanya sebagai safe zone
+Menggunakan analisa morfologi presisi:
+- Deteksi garis horizontal divider baris (morphological opening 280x1)
+- Deteksi garis vertikal frame mushaf (morphological opening 1x200)
+- Identifikasi inner text column (memisahkan kolom teks dari kolom margin waqf/ruku')
+- Klasifikasi halaman ayat vs halaman non-ayat (cover, daftar tajwid, dll.)
 """
 from __future__ import annotations
 import cv2
@@ -17,110 +16,99 @@ from dataclasses import dataclass
 
 
 @dataclass
-class Zone:
-    """Koordinat rectangle (pixel, 0-indexed, inklusif)."""
-    x1: int
-    y1: int
-    x2: int
-    y2: int
-
-    @property
-    def width(self):
-        return self.x2 - self.x1
-
-    @property
-    def height(self):
-        return self.y2 - self.y1
+class QuranLayout:
+    """Informasi layout terstruktur halaman mushaf."""
+    is_verse_page: bool
+    slots: list[tuple[int, int]]       # list of (y_top, y_bot) untuk setiap baris ayat
+    inner_left: int                    # batas kiri area teks ayat
+    inner_right: int                   # batas kanan area teks ayat
+    horiz_lines: np.ndarray            # binary mask garis horizontal
+    vert_lines: np.ndarray             # binary mask garis vertikal
 
 
-def pil_to_gray_array(img: Image.Image) -> np.ndarray:
-    """PIL RGB → numpy grayscale uint8."""
-    return np.array(img.convert("L"))
-
-
-def detect_text_zone(img: Image.Image, inner_margin: int = 60) -> Zone:
+def detect_quran_layout(
+    img: Image.Image | np.ndarray,
+    min_row_spacing: int = 75,
+    max_row_spacing: int = 122,
+    min_verse_slots: int = 5,
+) -> QuranLayout:
     """
-    Deteksi zona teks aman (di dalam border ornamen).
+    Analisa struktur halaman mushaf secara matematis.
 
-    Mengembalikan Zone yang sudah dikurangi margin agar
-    pixel border tidak ikut terfade.
+    Args:
+        img: PIL Image atau numpy array BGR/RGB
+        min_row_spacing: tinggi minimum slot baris ayat (px at ~150 DPI)
+        max_row_spacing: tinggi maksimum slot baris ayat (px at ~150 DPI)
+        min_verse_slots: jumlah minimum slot agar dianggap halaman ayat
 
-    Fallback: jika deteksi gagal, gunakan 8% margin dari tepi.
+    Returns:
+        QuranLayout
     """
-    gray = pil_to_gray_array(img)
-    h, w = gray.shape
+    if isinstance(img, Image.Image):
+        arr = np.array(img)
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        elif arr.ndim == 3 and arr.shape[2] == 4:
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGBA2GRAY)
+        else:
+            gray = arr
+    else:
+        if img.ndim == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img
 
-    # ── Threshold: piksel gelap = hitam/teks/border ──────────────────────
-    # Inverse binary: gelap → putih (foreground)
-    _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+    h, w = gray.shape[:2]
+    _, binary = cv2.threshold(gray, 190, 255, cv2.THRESH_BINARY_INV)
 
-    # ── Cari kolom dengan density piksel gelap tinggi (= border vertikal) ─
-    col_density = binary.mean(axis=0)   # rata-rata per kolom
+    # 1. Deteksi garis pembatas horizontal tipis (> 280 px lebar, 1-3 px tinggi)
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (280, 1))
+    horiz_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horiz_kernel)
 
-    # Ambang: kolom dengan > 15% piksel gelap = kemungkinan border
-    BORDER_THRESHOLD = 15.0
+    # Cari posisi Y tengah dari setiap garis horizontal
+    y_lines: list[int] = []
+    in_line = False
+    start_y = 0
+    for y in range(h):
+        val = horiz_lines[y].mean()
+        if val > 5:
+            if not in_line:
+                in_line = True
+                start_y = y
+        else:
+            if in_line:
+                in_line = False
+                y_lines.append((start_y + y) // 2)
 
-    left_x = _find_border_x(col_density, direction="left", threshold=BORDER_THRESHOLD, w=w)
-    right_x = _find_border_x(col_density, direction="right", threshold=BORDER_THRESHOLD, w=w)
+    # Cari slot baris ayat yang valid (jarak antar garis sesuai tinggi baris teks)
+    slots: list[tuple[int, int]] = []
+    for i in range(len(y_lines) - 1):
+        spacing = y_lines[i + 1] - y_lines[i]
+        if min_row_spacing <= spacing <= max_row_spacing:
+            slots.append((y_lines[i], y_lines[i + 1]))
 
-    # ── Cari baris dengan density piksel gelap tinggi (= border horizontal) ─
-    row_density = binary.mean(axis=1)
-    top_y = _find_border_y(row_density, direction="top", threshold=BORDER_THRESHOLD, h=h)
-    bottom_y = _find_border_y(row_density, direction="bottom", threshold=BORDER_THRESHOLD, h=h)
+    # Jika slot baris kurang dari batas minimum (misal Cover, Tajwid guide):
+    # Tandai sebagai non-verse page agar tidak disentuh sama sekali
+    is_verse_page = len(slots) >= min_verse_slots
 
-    # ── Tambahkan inner margin ──────────────────────────────────────────
-    x1 = min(left_x + inner_margin, w // 2)
-    x2 = max(right_x - inner_margin, w // 2)
-    y1 = min(top_y + inner_margin // 2, h // 2)
-    y2 = max(bottom_y - inner_margin // 2, h // 2)
+    # 2. Deteksi garis frame vertikal (> 200 px tinggi)
+    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 200))
+    vert_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vert_kernel)
 
-    # Validasi: zone harus masuk akal
-    if x2 - x1 < w * 0.3 or y2 - y1 < h * 0.3:
-        # Fallback ke 8% margin
-        margin_x = int(w * 0.08)
-        margin_y = int(h * 0.05)
-        x1, x2 = margin_x, w - margin_x
-        y1, y2 = margin_y, h - margin_y
+    v_indices = np.where(vert_lines.mean(axis=0) > 2)[0]
+    left_v = v_indices[v_indices < w // 2]
+    right_v = v_indices[v_indices >= w // 2]
 
-    return Zone(x1=x1, y1=y1, x2=x2, y2=y2)
+    # Inner left bound: garis terkanan di sisi kiri frame (melindungi kolom margin waqf/ruku')
+    inner_left = int(left_v[-1] + 2) if len(left_v) > 0 else int(w * 0.14)
+    # Inner right bound: garis terkiri di sisi kanan frame (melindungi kolom margin kanan)
+    inner_right = int(right_v[0] - 2) if len(right_v) > 0 else int(w * 0.88)
 
-
-def _find_border_x(col_density: np.ndarray, direction: str, threshold: float, w: int) -> int:
-    """Cari posisi x border dari kiri atau kanan."""
-    if direction == "left":
-        for x in range(0, w // 3):
-            if col_density[x] > threshold:
-                # Scan ke kanan sampai density turun
-                for x2 in range(x, w // 3):
-                    if col_density[x2] < threshold * 0.3:
-                        return x2
-                return x + 20
-        return int(w * 0.08)  # fallback
-    else:  # right
-        for x in range(w - 1, w * 2 // 3, -1):
-            if col_density[x] > threshold:
-                for x2 in range(x, w * 2 // 3, -1):
-                    if col_density[x2] < threshold * 0.3:
-                        return x2
-                return x - 20
-        return int(w * 0.92)  # fallback
-
-
-def _find_border_y(row_density: np.ndarray, direction: str, threshold: float, h: int) -> int:
-    """Cari posisi y border dari atas atau bawah."""
-    if direction == "top":
-        for y in range(0, h // 5):
-            if row_density[y] > threshold:
-                for y2 in range(y, h // 5):
-                    if row_density[y2] < threshold * 0.3:
-                        return y2
-                return y + 10
-        return int(h * 0.05)  # fallback
-    else:  # bottom
-        for y in range(h - 1, h * 4 // 5, -1):
-            if row_density[y] > threshold:
-                for y2 in range(y, h * 4 // 5, -1):
-                    if row_density[y2] < threshold * 0.3:
-                        return y2
-                return y - 10
-        return int(h * 0.95)  # fallback
+    return QuranLayout(
+        is_verse_page=is_verse_page,
+        slots=slots,
+        inner_left=inner_left,
+        inner_right=inner_right,
+        horiz_lines=horiz_lines,
+        vert_lines=vert_lines,
+    )

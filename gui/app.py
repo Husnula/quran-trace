@@ -40,7 +40,7 @@ class TraceQuranApp(tk.Tk):
         self._opacity_var = tk.DoubleVar(value=FADE_PRESETS[FADE_DEFAULT])
         self._keep_border = tk.BooleanVar(value=True)
         self._keep_waqf = tk.BooleanVar(value=True)
-        self._keep_ayat = tk.BooleanVar(value=False)
+        self._keep_ayat = tk.BooleanVar(value=True)
         self._dpi_var = tk.StringVar(value="Cetak (300 DPI)")
         self._output_path_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="Siap - Pilih atau drag PDF Al-Qur'an")

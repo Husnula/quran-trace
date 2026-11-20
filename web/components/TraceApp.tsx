@@ -11,9 +11,9 @@ import { processPdf, previewPage, getPdfPageCount, type ProcessOptions } from "@
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const PRESETS = [
-  { label: "Sangat Samar", value: 0.12, desc: "12% — hampir tak terlihat" },
-  { label: "Samar",        value: 0.22, desc: "22% — nyaman ditebalkan" },
-  { label: "Agak Terlihat", value: 0.38, desc: "38% — panduan jelas" },
+  { label: "Sangat Samar", value: 0.10, desc: "10% — hampir tak terlihat" },
+  { label: "Samar",        value: 0.18, desc: "18% — standar ideal FunFurqan" },
+  { label: "Agak Terlihat", value: 0.30, desc: "30% — panduan jelas" },
 ];
 
 type State = "idle" | "previewing" | "processing" | "done" | "error";
@@ -31,9 +31,9 @@ export default function TraceQuranApp() {
 
   // Options
   const [presetIdx, setPresetIdx] = useState(1); // "Samar" default
-  const [opacity, setOpacity] = useState(0.22);
+  const [opacity, setOpacity] = useState(0.18);
   const [keepWaqf, setKeepWaqf] = useState(true);
-  const [keepAyat, setKeepAyat] = useState(false);
+  const [keepAyat, setKeepAyat] = useState(true);
 
   const cancelRef = useRef({ cancelled: false });
 

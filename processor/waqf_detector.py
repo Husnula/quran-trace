@@ -1,149 +1,84 @@
 """
 processor/waqf_detector.py
-Deteksi dan mask tanda waqf agar tidak ikut terfade.
+Deteksi dan proteksi penanda nomor ayat (Ayah Rosettes) dan tanda waqf margin.
 
-Tanda waqf dalam mushaf Utsmani (Rasm Utsmani):
-  ع / م  = Waqf Lazim (harus berhenti)
-  ط       = Waqf Mutlak
-  ص       = Waqf Murakhkhas  
-  ج       = Waqf Jaiz
-  ز       = Waqf Mujawwaz
-  ق       = Qila Fihil Waqf
-  لا      = La Waqf (jangan berhenti)
-  قلي     = Qalil
+Prinsip deteksi:
+1. Roset Nomor Ayat (Bunga/Lingkaran Ayat):
+   - Berupa ornamen bunga/lingkaran dengan ukiran berulang dan angka ayat di dalamnya.
+   - Memiliki kontur berlapis (hierarchy child_count >= 8) dan area > 1000 px².
+   - Aspek rasio simetris (~0.70 - 1.30) dan ukuran standar (~30 - 80 px).
+   - Dipertahankan 100% hitam pekat agar nomor ayat tetap jelas dibaca.
 
-Semua simbol ini:
-1. Berukuran KECIL (superscript di atas kata atau di margin)
-2. Terletak di luar jalur teks utama (di atas atau di kiri baris)
-3. Berbentuk huruf Arab tunggal atau dua huruf
+2. Tanda Waqf Margin (misal Waqf Lazim 'ع' / Ruku' di kolom margin luar):
+   - Terletak di luar batas inner_left/inner_right text column.
+   - Otomatis 100% terlindungi oleh layout masking.
 
-Strategi deteksi:
-- Jalankan connected component analysis
-- Komponen kecil (< WAQF_MAX_COMPONENT_AREA px²) DI LUAR zona teks normal
-  dianggap sebagai kandidat waqf/harakat
-- Nomor ayat: juga kecil tetapi lebih besar, dalam lingkaran → exclude
+3. Tanda Waqf & Harakat dalam Baris Ayat:
+   - Dibuat samar seragam bersama huruf ayat agar santri dapat menebalkan
+     seluruh tulisan ayat secara natural (sesuai standar FunFurqan & Trace Quran).
 """
 from __future__ import annotations
 import cv2
 import numpy as np
-from PIL import Image
-from .region_detector import Zone
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import (
-    WAQF_MAX_COMPONENT_AREA,
-    WAQF_MAX_COMPONENT_WIDTH,
-    WAQF_MAX_COMPONENT_HEIGHT,
-    AYAT_MIN_AREA,
-    AYAT_MAX_AREA,
-    AYAT_CIRCULARITY_MIN,
-)
+from .region_detector import QuranLayout
 
 
-def build_preserve_mask(
-    img_array: np.ndarray,
-    text_zone: Zone,
-    keep_waqf: bool = True,
-    keep_ayat: bool = False,
+def detect_ayah_rosettes(
+    binary: np.ndarray,
+    layout: QuranLayout,
+    min_size: int = 30,
+    max_size: int = 80,
+    min_area: float = 1000.0,
+    min_children: int = 8,
+    pad: int = 3,
 ) -> np.ndarray:
     """
-    Buat mask boolean (H x W) di mana True = pixel yang HARUS tetap hitam.
+    Deteksi roset nomor ayat di dalam zona teks menggunakan analisa hierarki kontur.
+
+    Args:
+        binary: gambar biner inversi (foreground = 255)
+        layout: QuranLayout hasil deteksi region_detector
+        min_size: lebar/tinggi minimum roset
+        max_size: lebar/tinggi maksimum roset
+        min_area: luas kontur minimum
+        min_children: jumlah anak kontur minimum (lingkaran ornamen + angka)
+        pad: padding pixel pelindung di sekitar roset
 
     Returns:
-        preserve_mask: np.ndarray bool, True di area yang tidak boleh difade
+        np.ndarray bool (H, W) di mana True = area roset nomor ayat
     """
-    h, w = img_array.shape[:2]
-    preserve_mask = np.zeros((h, w), dtype=bool)
+    h, w = binary.shape[:2]
+    rosette_mask = np.zeros((h, w), dtype=bool)
 
-    # ── Area luar text_zone selalu dipertahankan (border ornamen) ─────────
-    # Area border = semua yang di luar zone
-    preserve_mask[:text_zone.y1, :] = True          # atas
-    preserve_mask[text_zone.y2:, :] = True          # bawah
-    preserve_mask[:, :text_zone.x1] = True          # kiri
-    preserve_mask[:, text_zone.x2:] = True          # kanan
+    if not layout.is_verse_page:
+        return rosette_mask
 
-    if not keep_waqf and not keep_ayat:
-        return preserve_mask
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None or len(contours) == 0:
+        return rosette_mask
 
-    # ── Connected component analysis dalam text_zone ─────────────────────
-    # Ambil region teks saja
-    region = img_array[text_zone.y1:text_zone.y2, text_zone.x1:text_zone.x2]
-    gray_region = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY) if region.ndim == 3 else region
-    _, binary = cv2.threshold(gray_region, 180, 255, cv2.THRESH_BINARY_INV)
+    hierarchy = hierarchy[0]
+    for i, c in enumerate(contours):
+        x, y, bw, bh = cv2.boundingRect(c)
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        # Harus berada di dalam rentang kolom teks ayat
+        if layout.inner_left <= x and x + bw <= layout.inner_right:
+            if min_size <= bw <= max_size and min_size <= bh <= max_size:
+                aspect = bw / float(bh)
+                if 0.70 <= aspect <= 1.30:
+                    # Hitung anak kontur (child hierarchy)
+                    child_count = 0
+                    child_idx = hierarchy[i][2]
+                    while child_idx != -1:
+                        child_count += 1
+                        child_idx = hierarchy[child_idx][0]
 
-    for label_id in range(1, num_labels):  # skip background (0)
-        x, y, bw, bh, area = stats[label_id, :5]
-        circularity = _circularity(binary, labels, label_id, bw, bh, area)
+                    area = cv2.contourArea(c)
+                    if child_count >= min_children and area > min_area:
+                        y1 = max(0, y - pad)
+                        y2 = min(h, y + bh + pad)
+                        x1 = max(0, x - pad)
+                        x2 = min(w, x + bw + pad)
+                        rosette_mask[y1:y2, x1:x2] = True
 
-        if keep_waqf and _is_waqf_candidate(area, bw, bh):
-            # Tandai komponen ini sebagai preserve
-            comp_mask = (labels == label_id)
-            # Offset balik ke koordinat gambar penuh
-            full_y1 = text_zone.y1 + y
-            full_y2 = text_zone.y1 + y + bh
-            full_x1 = text_zone.x1 + x
-            full_x2 = text_zone.x1 + x + bw
-            # Clamp
-            full_y2 = min(full_y2, h)
-            full_x2 = min(full_x2, w)
-            # Tambahkan sedikit padding di sekitar simbol
-            pad = 4
-            py1 = max(0, full_y1 - pad)
-            py2 = min(h, full_y2 + pad)
-            px1 = max(0, full_x1 - pad)
-            px2 = min(w, full_x2 + pad)
-            preserve_mask[py1:py2, px1:px2] = True
-
-        elif keep_ayat and _is_ayat_candidate(area, bw, bh, circularity):
-            full_y1 = text_zone.y1 + y
-            full_x1 = text_zone.x1 + x
-            full_y2 = min(text_zone.y1 + y + bh, h)
-            full_x2 = min(text_zone.x1 + x + bw, w)
-            pad = 6
-            preserve_mask[
-                max(0, full_y1 - pad):min(h, full_y2 + pad),
-                max(0, full_x1 - pad):min(w, full_x2 + pad),
-            ] = True
-
-    return preserve_mask
-
-
-def _is_waqf_candidate(area: int, bw: int, bh: int) -> bool:
-    """Heuristik: komponen kecil = kemungkinan tanda waqf atau harakat."""
-    return (
-        area < WAQF_MAX_COMPONENT_AREA
-        and bw < WAQF_MAX_COMPONENT_WIDTH
-        and bh < WAQF_MAX_COMPONENT_HEIGHT
-        and area > 20  # bukan noise 1-2 pixel
-    )
-
-
-def _is_ayat_candidate(area: int, bw: int, bh: int, circularity: float) -> bool:
-    """Heuristik: nomor ayat dalam lingkaran/oktagon."""
-    return (
-        AYAT_MIN_AREA <= area <= AYAT_MAX_AREA
-        and circularity >= AYAT_CIRCULARITY_MIN
-        and abs(bw - bh) < max(bw, bh) * 0.4  # rasio mendekati kotak
-    )
-
-
-def _circularity(
-    binary: np.ndarray,
-    labels: np.ndarray,
-    label_id: int,
-    bw: int,
-    bh: int,
-    area: int,
-) -> float:
-    """Hitung circularity = 4π*area / perimeter²."""
-    comp = (labels == label_id).astype(np.uint8) * 255
-    contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return 0.0
-    perimeter = cv2.arcLength(contours[0], True)
-    if perimeter == 0:
-        return 0.0
-    return (4 * np.pi * area) / (perimeter ** 2)
+    return rosette_mask

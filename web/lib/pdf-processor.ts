@@ -1,16 +1,16 @@
 /**
  * lib/pdf-processor.ts
- * Browser-side PDF processing pipeline.
- * Uses pdf.js to render, Canvas 2D to fade, pdf-lib to output.
- * Runs entirely client-side - no server, no upload.
+ * Browser-side PDF processing pipeline with precision slot & rosette preservation.
+ * Runs entirely client-side using Canvas 2D and pdf-lib.
+ * Zero API keys, 100% offline, zero server overhead.
  */
 
 import { PDFDocument } from "pdf-lib";
 
 export interface ProcessOptions {
-  opacity: number;       // 0.08-0.60: fade level for Arabic text
-  keepWaqf: boolean;     // preserve small waqf marks
-  keepAyat: boolean;     // preserve ayat circle numbers
+  opacity: number;       // 0.08-0.50: fade level for Arabic text (default 0.18)
+  keepWaqf: boolean;     // preserve margin waqf/ruku' marks (default true)
+  keepAyat: boolean;     // preserve ayat rosette circles (default true)
   dpi?: number;          // render DPI (default 150 for web preview, 200 for output)
 }
 
@@ -33,110 +33,283 @@ async function getPdfjs() {
   return pdfjsLib;
 }
 
-// --- Region detection (port of Python logic) ---
-interface Zone {
-  x1: number; y1: number; x2: number; y2: number;
+interface Slot {
+  yTop: number;
+  yBot: number;
 }
 
-function detectTextZone(imageData: ImageData, innerMargin = 50): Zone {
-  const { width, height, data } = imageData;
+interface PageLayout {
+  isVersePage: boolean;
+  slots: Slot[];
+  innerLeft: number;
+  innerRight: number;
+  horizLineMask: Uint8Array;
+}
 
-  // Build grayscale + dark pixel column/row density
-  const colDensity = new Float32Array(width);
-  const rowDensity = new Float32Array(height);
+/**
+ * Precision detection of Quran row divider lines, column frames, and slots.
+ */
+function analyzeQuranLayout(imageData: ImageData, scale: number): PageLayout {
+  const { width, height, data } = imageData;
+  const isDark = (idx: number) => {
+    return (data[idx] + data[idx + 1] + data[idx + 2]) / 3 < 185;
+  };
+
+  const minHorizRun = Math.max(180, Math.floor(220 * (scale / 1.5)));
+  const minVertRun = Math.max(140, Math.floor(180 * (scale / 1.5)));
+  const minRowSpacing = Math.max(50, Math.floor(65 * (scale / 1.5)));
+  const maxRowSpacing = Math.floor(135 * (scale / 1.5));
+
+  // 1. Detect thin horizontal divider lines
+  const horizLineRows = new Uint8Array(height);
+  const horizLineMask = new Uint8Array(width * height);
 
   for (let y = 0; y < height; y++) {
+    let maxRun = 0;
+    let curRun = 0;
+    const rowOffset = y * width;
     for (let x = 0; x < width; x++) {
-      const idx = (y * width + x) * 4;
-      const brightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-      if (brightness < 180) {
-        colDensity[x] += 100 / height;
-        rowDensity[y] += 100 / width;
+      if (isDark((rowOffset + x) * 4)) {
+        curRun++;
+        if (curRun > maxRun) maxRun = curRun;
+      } else {
+        curRun = 0;
+      }
+    }
+    if (maxRun >= minHorizRun) {
+      horizLineRows[y] = 1;
+      // Mark line pixels
+      for (let x = 0; x < width; x++) {
+        if (isDark((rowOffset + x) * 4)) {
+          horizLineMask[rowOffset + x] = 1;
+        }
       }
     }
   }
 
-  const THRESH = 12;
-  const THIRD = Math.floor(width / 3);
-  const H_FIFTH = Math.floor(height / 5);
-
-  // Find left border edge
-  let leftX = Math.floor(width * 0.08);
-  outer: for (let x = 0; x < THIRD; x++) {
-    if (colDensity[x] > THRESH) {
-      for (let x2 = x; x2 < THIRD; x2++) {
-        if (colDensity[x2] < THRESH * 0.3) { leftX = x2; break outer; }
+  // Group contiguous horizontal rows into single line positions
+  const yLines: number[] = [];
+  let inLine = false;
+  let startY = 0;
+  for (let y = 0; y < height; y++) {
+    if (horizLineRows[y] === 1) {
+      if (!inLine) {
+        inLine = true;
+        startY = y;
+      }
+    } else {
+      if (inLine) {
+        inLine = false;
+        yLines.push(Math.floor((startY + y) / 2));
       }
     }
   }
 
-  // Find right border edge
-  let rightX = Math.floor(width * 0.92);
-  outer: for (let x = width - 1; x > width * 2 / 3; x--) {
-    if (colDensity[x] > THRESH) {
-      for (let x2 = x; x2 > width * 2 / 3; x2--) {
-        if (colDensity[x2] < THRESH * 0.3) { rightX = x2; break outer; }
-      }
+  // Find regular Quran text slots
+  const slots: Slot[] = [];
+  for (let i = 0; i < yLines.length - 1; i++) {
+    const spacing = yLines[i + 1] - yLines[i];
+    if (spacing >= minRowSpacing && spacing <= maxRowSpacing) {
+      slots.push({ yTop: yLines[i], yBot: yLines[i + 1] });
     }
   }
 
-  // Find top border edge
-  let topY = Math.floor(height * 0.05);
-  outer: for (let y = 0; y < H_FIFTH; y++) {
-    if (rowDensity[y] > THRESH) {
-      for (let y2 = y; y2 < H_FIFTH; y2++) {
-        if (rowDensity[y2] < THRESH * 0.3) { topY = y2; break outer; }
+  // Non-verse pages (Cover, intro, tajwid guide) have < 5 regular slots
+  const isVersePage = slots.length >= 5;
+
+  // 2. Detect tall vertical frame lines
+  const vertLineCols: number[] = [];
+  for (let x = 0; x < width; x++) {
+    let maxRun = 0;
+    let curRun = 0;
+    for (let y = 0; y < height; y++) {
+      if (isDark((y * width + x) * 4)) {
+        curRun++;
+        if (curRun > maxRun) maxRun = curRun;
+      } else {
+        curRun = 0;
       }
+    }
+    if (maxRun >= minVertRun) {
+      vertLineCols.push(x);
     }
   }
 
-  // Find bottom border edge
-  let bottomY = Math.floor(height * 0.95);
-  outer: for (let y = height - 1; y > height * 4 / 5; y--) {
-    if (rowDensity[y] > THRESH) {
-      for (let y2 = y; y2 > height * 4 / 5; y2--) {
-        if (rowDensity[y2] < THRESH * 0.3) { bottomY = y2; break outer; }
-      }
-    }
-  }
+  const midX = width / 2;
+  const leftCols = vertLineCols.filter((x) => x < midX);
+  const rightCols = vertLineCols.filter((x) => x >= midX);
 
-  let x1 = Math.min(leftX + innerMargin, Math.floor(width / 2));
-  let x2 = Math.max(rightX - innerMargin, Math.floor(width / 2));
-  let y1 = Math.min(topY + Math.floor(innerMargin / 2), Math.floor(height / 2));
-  let y2 = Math.max(bottomY - Math.floor(innerMargin / 2), Math.floor(height / 2));
+  const innerLeft = leftCols.length > 0 ? leftCols[leftCols.length - 1] + 2 : Math.floor(width * 0.14);
+  const innerRight = rightCols.length > 0 ? rightCols[0] - 2 : Math.floor(width * 0.88);
 
-  // Fallback if zone is too small
-  if (x2 - x1 < width * 0.3 || y2 - y1 < height * 0.3) {
-    const mx = Math.floor(width * 0.08);
-    const my = Math.floor(height * 0.05);
-    return { x1: mx, y1: my, x2: width - mx, y2: height - my };
-  }
-
-  return { x1, y1, x2, y2 };
+  return {
+    isVersePage,
+    slots,
+    innerLeft,
+    innerRight,
+    horizLineMask,
+  };
 }
 
-// --- Fade engine ---
-function applyFade(
+/**
+ * Detect Ayah rosette circles using connected component analysis in valid slots.
+ */
+function findAyahRosetteMask(
   imageData: ImageData,
-  zone: Zone,
-  opacity: number,
-  keepWaqf: boolean,
-): void {
-  const { width, data } = imageData;
-  const DARK_THRESH = 200; // pixel dengan rata-rata RGB < ini dianggap teks
+  layout: PageLayout,
+  scale: number,
+): Uint8Array {
+  const { width, height, data } = imageData;
+  const rosetteMask = new Uint8Array(width * height);
+  if (!layout.isVersePage) return rosetteMask;
 
-  for (let y = zone.y1; y < zone.y2; y++) {
-    for (let x = zone.x1; x < zone.x2; x++) {
-      const idx = (y * width + x) * 4;
-      const r = data[idx], g = data[idx + 1], b = data[idx + 2];
-      const brightness = (r + g + b) / 3;
+  const minRosetteSize = Math.max(22, Math.floor(28 * (scale / 1.5)));
+  const maxRosetteSize = Math.floor(75 * (scale / 1.5));
+  const minPixels = Math.max(160, Math.floor(240 * (scale / 1.5)));
 
-      if (brightness < DARK_THRESH) {
-        // Blend pixel gelap ke putih sesuai opacity
-        data[idx]     = Math.round(r * opacity + 255 * (1 - opacity));
-        data[idx + 1] = Math.round(g * opacity + 255 * (1 - opacity));
-        data[idx + 2] = Math.round(b * opacity + 255 * (1 - opacity));
+  // Analyze dark connected components within each verse slot
+  const visited = new Uint8Array(width * height);
+  const queueX = new Int32Array(width * height);
+  const queueY = new Int32Array(width * height);
+
+  for (const slot of layout.slots) {
+    const yStart = slot.yTop + 2;
+    const yEnd = slot.yBot - 2;
+
+    for (let y = yStart; y <= yEnd; y++) {
+      const rowOffset = y * width;
+      for (let x = layout.innerLeft; x <= layout.innerRight; x++) {
+        const offset = rowOffset + x;
+        if (visited[offset]) continue;
+
+        const idx = offset * 4;
+        const brightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
+        if (brightness >= 185) continue; // background
+
+        // BFS connected component
+        let qHead = 0;
+        let qTail = 0;
+        queueX[qTail] = x;
+        queueY[qTail] = y;
+        qTail++;
+        visited[offset] = 1;
+
+        let minX = x, maxX = x, minY = y, maxY = y;
+        let count = 0;
+
+        while (qHead < qTail) {
+          const cx = queueX[qHead];
+          const cy = queueY[qHead];
+          qHead++;
+          count++;
+
+          if (cx < minX) minX = cx;
+          if (cx > maxX) maxX = cx;
+          if (cy < minY) minY = cy;
+          if (cy > maxY) maxY = cy;
+
+          // 4-connected neighbors
+          const neighbors = [
+            [cx + 1, cy], [cx - 1, cy],
+            [cx, cy + 1], [cx, cy - 1]
+          ];
+
+          for (const [nx, ny] of neighbors) {
+            if (nx >= layout.innerLeft && nx <= layout.innerRight && ny >= yStart && ny <= yEnd) {
+              const noff = ny * width + nx;
+              if (!visited[noff]) {
+                const nidx = noff * 4;
+                const nb = (data[nidx] + data[nidx + 1] + data[nidx + 2]) / 3;
+                if (nb < 185) {
+                  visited[noff] = 1;
+                  queueX[qTail] = nx;
+                  queueY[qTail] = ny;
+                  qTail++;
+                }
+              }
+            }
+          }
+        }
+
+        const bw = maxX - minX + 1;
+        const bh = maxY - minY + 1;
+        const aspect = bw / bh;
+
+        // Ayah Rosette characteristics: symmetrical, dense, medium size
+        if (
+          bw >= minRosetteSize && bw <= maxRosetteSize &&
+          bh >= minRosetteSize && bh <= maxRosetteSize &&
+          aspect >= 0.70 && aspect <= 1.30 &&
+          count >= minPixels
+        ) {
+          const pad = 3;
+          const py1 = Math.max(0, minY - pad);
+          const py2 = Math.min(height - 1, maxY + pad);
+          const px1 = Math.max(0, minX - pad);
+          const px2 = Math.min(width - 1, maxX + pad);
+
+          for (let ry = py1; ry <= py2; ry++) {
+            const roff = ry * width;
+            for (let rx = px1; rx <= px2; rx++) {
+              rosetteMask[roff + rx] = 1;
+            }
+          }
+        }
       }
+    }
+  }
+
+  return rosetteMask;
+}
+
+/**
+ * Apply precision fading only to Arabic verse text inside valid line slots.
+ */
+function applyPrecisionFade(
+  imageData: ImageData,
+  layout: PageLayout,
+  rosetteMask: Uint8Array,
+  opacity: number,
+  keepAyat: boolean,
+): void {
+  if (!layout.isVersePage) return; // Leave cover / non-verse pages 100% untouched
+
+  const { width, data } = imageData;
+
+  // Build slot lookup
+  const inSlot = new Uint8Array(imageData.width * imageData.height);
+  for (const slot of layout.slots) {
+    const y1 = slot.yTop + 2;
+    const y2 = slot.yBot - 2;
+    for (let y = y1; y <= y2; y++) {
+      const rowOffset = y * width;
+      for (let x = layout.innerLeft; x <= layout.innerRight; x++) {
+        inSlot[rowOffset + x] = 1;
+      }
+    }
+  }
+
+  for (let offset = 0; offset < inSlot.length; offset++) {
+    // Only fade pixels that are inside a valid verse slot
+    if (!inSlot[offset]) continue;
+
+    // Do NOT fade horizontal lines
+    if (layout.horizLineMask[offset]) continue;
+
+    // Do NOT fade Ayah rosettes if keepAyat is true
+    if (keepAyat && rosetteMask[offset]) continue;
+
+    const idx = offset * 4;
+    const r = data[idx];
+    const g = data[idx + 1];
+    const b = data[idx + 2];
+    const brightness = (r + g + b) / 3;
+
+    // Fade dark verse text & harakat smoothly
+    if (brightness < 190) {
+      data[idx]     = Math.round(r * opacity + 255 * (1 - opacity));
+      data[idx + 1] = Math.round(g * opacity + 255 * (1 - opacity));
+      data[idx + 2] = Math.round(b * opacity + 255 * (1 - opacity));
     }
   }
 }
@@ -161,14 +334,14 @@ async function processOnePage(
   // Get pixel data
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-  // Detect text zone (inside border)
-  const zone = detectTextZone(imageData, 50);
+  // Analyze page structure
+  const layout = analyzeQuranLayout(imageData, scale);
 
-  // Apply fade
-  applyFade(imageData, zone, options.opacity, options.keepWaqf);
-
-  // Write back
-  ctx.putImageData(imageData, 0, 0);
+  if (layout.isVersePage) {
+    const rosetteMask = findAyahRosetteMask(imageData, layout, scale);
+    applyPrecisionFade(imageData, layout, rosetteMask, options.opacity, options.keepAyat ?? true);
+    ctx.putImageData(imageData, 0, 0);
+  }
 
   return canvas.toDataURL("image/jpeg", 0.92);
 }
@@ -233,7 +406,7 @@ export async function previewPage(
   const arrayBuffer = await file.arrayBuffer();
   const pdfDoc = await pdfjs.getDocument({ data: arrayBuffer }).promise;
   const page = await pdfDoc.getPage(pageNum);
-  return processOnePage(page, options, 120); // lower DPI for fast preview
+  return processOnePage(page, options, 140);
 }
 
 export async function getPdfPageCount(file: File): Promise<number> {

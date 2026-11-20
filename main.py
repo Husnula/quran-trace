@@ -51,7 +51,7 @@ def run_cli(args):
     print(f"DPI    : {dpi}")
     print(f"Keep border: {not args.no_border}")
     print(f"Keep waqf  : {not args.no_waqf}")
-    print(f"Keep ayat  : {args.keep_ayat}")
+    print(f"Keep ayat  : {not args.no_ayat}")
     print()
 
     def on_progress(done: int, total: int):
@@ -68,7 +68,7 @@ def run_cli(args):
             opacity=args.opacity,
             keep_border=not args.no_border,
             keep_waqf=not args.no_waqf,
-            keep_ayat=args.keep_ayat,
+            keep_ayat=not args.no_ayat,
             dpi=dpi,
             progress_callback=on_progress,
         )
@@ -96,17 +96,17 @@ Contoh:
     parser.add_argument("--input", "-i", help="Path ke file PDF Al-Qur'an")
     parser.add_argument("--output", "-o", help="Path file output (opsional)")
     parser.add_argument(
-        "--opacity", type=float, default=0.22,
-        help="Level samar: 0.1 (sangat samar) - 0.6 (agak terlihat). Default: 0.22",
+        "--opacity", type=float, default=0.18,
+        help="Level samar: 0.08 (sangat samar) - 0.50 (agak terlihat). Default: 0.18",
     )
     parser.add_argument("--dpi", type=int, default=300, choices=[150, 300],
                         help="Resolusi output. 150=draft, 300=cetak. Default: 300")
     parser.add_argument("--no-border", action="store_true",
                         help="Ikutkan border ornamen dalam fade (tidak disarankan)")
     parser.add_argument("--no-waqf", action="store_true",
-                        help="Ikutkan tanda waqf dalam fade")
-    parser.add_argument("--keep-ayat", action="store_true",
-                        help="Pertahankan nomor ayat tetap hitam")
+                        help="Ikutkan tanda waqf margin dalam fade")
+    parser.add_argument("--no-ayat", action="store_true",
+                        help="Ikutkan roset nomor ayat dalam fade (default: roset tetap hitam)")
 
     args = parser.parse_args()
 
