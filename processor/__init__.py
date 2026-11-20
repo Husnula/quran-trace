@@ -21,6 +21,7 @@ from config import DPI_PRINT, DPI_PREVIEW
 def process_pdf(
     input_path: str | Path,
     output_path: str | Path | None = None,
+    model: str = "gray",
     opacity: float = 0.18,
     keep_border: bool = True,
     keep_waqf: bool = True,
@@ -67,6 +68,7 @@ def process_pdf(
         # 2. Proses penyamaran dengan deteksi slot struktural & preservasi roset
         result_img = fade_page(
             img=img,
+            model=model,
             opacity=opacity,
             keep_border=keep_border,
             keep_waqf=keep_waqf,
@@ -88,6 +90,7 @@ def process_pdf(
 def preview_page(
     input_path: str | Path,
     page_num: int = 0,
+    model: str = "gray",
     opacity: float = 0.18,
     keep_waqf: bool = True,
     keep_ayat: bool = True,
@@ -99,6 +102,7 @@ def preview_page(
     Args:
         input_path: Path ke PDF
         page_num: Nomor halaman (0-indexed)
+        model: "gray" atau "outline"
         opacity: Tingkat samar
         keep_waqf: Pertahankan waqf margin
         keep_ayat: Pertahankan roset ayat
@@ -113,6 +117,7 @@ def preview_page(
 
     return fade_page(
         img=img,
+        model=model,
         opacity=opacity,
         keep_waqf=keep_waqf,
         keep_ayat=keep_ayat,

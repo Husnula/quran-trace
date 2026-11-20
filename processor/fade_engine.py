@@ -1,6 +1,9 @@
 """
 processor/fade_engine.py
 Engine penyamar teks ayat Al-Qur'an dengan preservasi struktur mushaf.
+Mendukung 2 Model Tracing:
+- Model A: Light Gray (Abu-abu tipis presisi, standar FunFurqan)
+- Model B: Outline (Garis tepi tipis, dalam huruf putih/hollow kaligrafi)
 
 Menjaga 100% ketajaman:
 - Border ornamen dan frame luar
@@ -10,10 +13,6 @@ Menjaga 100% ketajaman:
 - Roset nomor ayat (bunga nomor ayat)
 - Tanda waqf margin (seperti 'ع' waqf lazim / ruku')
 - Halaman non-ayat (cover, daftar tajwid, dll.)
-
-Menyamarkan secara halus & merata:
-- Teks ayat Al-Qur'an (huruf hijaiyah + harakat + tanda baca)
-  agar dapat ditebalkan dengan mudah dan jelas oleh siswa/santri.
 """
 from __future__ import annotations
 import cv2
@@ -25,6 +24,7 @@ from .waqf_detector import detect_ayah_rosettes
 
 def fade_page(
     img: Image.Image,
+    model: str = "gray",
     opacity: float = 0.18,
     keep_border: bool = True,
     keep_waqf: bool = True,
@@ -36,7 +36,8 @@ def fade_page(
 
     Args:
         img: PIL Image RGB/RGBA
-        opacity: tingkat kecerahan samar (0.18 default, 0.08 sangat samar, 0.35 cukup terlihat)
+        model: "gray" (Light Gray) atau "outline" (Garis tepi / hollow)
+        opacity: tingkat kecerahan samar (0.18 default)
         keep_border: pertahankan border ornamen dan garis (selalu True)
         keep_waqf: pertahankan tanda waqf margin
         keep_ayat: pertahankan roset nomor ayat
@@ -55,7 +56,7 @@ def fade_page(
     if layout is None:
         layout = detect_quran_layout(gray)
 
-    # Jika bukan halaman ayat (misal Cover / Pengantar Tajwid), kembalikan asli tanpa ubahan
+    # Jika bukan halaman ayat (Cover / Pengantar Tajwid), kembalikan asli tanpa ubahan
     if not layout.is_verse_page:
         return Image.fromarray(arr, mode="RGB")
 
@@ -78,8 +79,24 @@ def fade_page(
         rosette_mask = detect_ayah_rosettes(binary, layout)
         preserve_mask |= rosette_mask
 
-    # 6. Blend penyamaran: pixel_faded = pixel * opacity + 255 * (1 - opacity)
-    faded = (arr.astype(np.float32) * opacity + 255.0 * (1.0 - opacity)).clip(0, 255).astype(np.uint8)
+    # 6. Pemrosesan teks ayat berdasarkan model tracing
+    if model == "outline":
+        # MODEL B: Outline (Garis tepi tipis, dalam huruf putih)
+        text_pixels = (binary > 0) & (~preserve_mask)
+        text_binary = text_pixels.astype(np.uint8) * 255
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        eroded = cv2.erode(text_binary, kernel)
+        outline = cv2.subtract(text_binary, eroded)
+
+        # Background putih
+        faded = np.full_like(arr, 255)
+        # Garis tepi tipis abu-abu tajam
+        line_val = int(110 * (1.0 - opacity * 0.5))
+        faded[outline > 0] = [line_val, line_val, line_val]
+    else:
+        # MODEL A: Light Gray (Abu-abu seragam)
+        faded = (arr.astype(np.float32) * opacity + 255.0 * (1.0 - opacity)).clip(0, 255).astype(np.uint8)
 
     # Gabungkan: area terlindungi pakai pixel asli, area teks pakai faded
     result = np.where(preserve_mask[:, :, None], arr, faded)
@@ -88,6 +105,7 @@ def fade_page(
 
 def process_page(
     img: Image.Image,
+    model: str = "gray",
     opacity: float = 0.18,
     keep_border: bool = True,
     keep_waqf: bool = True,
@@ -96,6 +114,7 @@ def process_page(
     """Wrapper praktis untuk fade_page."""
     return fade_page(
         img=img,
+        model=model,
         opacity=opacity,
         keep_border=keep_border,
         keep_waqf=keep_waqf,

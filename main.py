@@ -47,6 +47,7 @@ def run_cli(args):
 
     print(f"Input  : {input_path}")
     print(f"Output : {output_path}")
+    print(f"Model  : {args.model}")
     print(f"Opacity: {args.opacity} ({int(args.opacity*100)}%)")
     print(f"DPI    : {dpi}")
     print(f"Keep border: {not args.no_border}")
@@ -65,6 +66,7 @@ def run_cli(args):
         result = process_pdf(
             input_path,
             output_path=output_path,
+            model=args.model,
             opacity=args.opacity,
             keep_border=not args.no_border,
             keep_waqf=not args.no_waqf,
@@ -95,6 +97,10 @@ Contoh:
     parser.add_argument("--cli", action="store_true", help="Jalankan mode CLI (tanpa GUI)")
     parser.add_argument("--input", "-i", help="Path ke file PDF Al-Qur'an")
     parser.add_argument("--output", "-o", help="Path file output (opsional)")
+    parser.add_argument(
+        "--model", choices=["gray", "outline"], default="gray",
+        help="Model tracing: 'gray' (Light Gray) atau 'outline' (Garis tepi tipis). Default: gray",
+    )
     parser.add_argument(
         "--opacity", type=float, default=0.18,
         help="Level samar: 0.08 (sangat samar) - 0.50 (agak terlihat). Default: 0.18",
