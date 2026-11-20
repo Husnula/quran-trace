@@ -1,22 +1,21 @@
 /**
  * lib/pdf-processor.ts
- * Browser-side PDF processing pipeline with precision slot & rosette preservation.
- * Runs entirely client-side using Canvas 2D and pdf-lib.
- * Zero API keys, 100% offline, zero server overhead.
+ * Browser-side PDF & Image processing pipeline with precision slot & rosette preservation.
+ * Supports Model A (Light Gray) & Model B (Outline / Hollow).
+ * Runs 100% client-side - zero server, zero API key, 100% offline.
  */
 
 import { PDFDocument } from "pdf-lib";
 
+export type TracingModel = "gray" | "outline";
+
 export interface ProcessOptions {
-  opacity: number;       // 0.08-0.50: fade level for Arabic text (default 0.18)
+  model?: TracingModel;  // "gray" (default) or "outline"
+  opacity: number;       // for gray: 0.08-0.50 (default 0.18)
+  outlineWidth?: number; // for outline: 1 or 2 (default 1)
   keepWaqf: boolean;     // preserve margin waqf/ruku' marks (default true)
   keepAyat: boolean;     // preserve ayat rosette circles (default true)
-  dpi?: number;          // render DPI (default 150 for web preview, 200 for output)
-}
-
-export interface PageResult {
-  pageNum: number;
-  dataUrl: string;       // PNG data URL for preview
+  dpi?: number;          // render DPI
 }
 
 export type ProgressCallback = (done: number, total: number) => void;
@@ -27,7 +26,6 @@ let pdfjsLib: typeof import("pdfjs-dist") | null = null;
 async function getPdfjs() {
   if (!pdfjsLib) {
     pdfjsLib = await import("pdfjs-dist");
-    // Worker via CDN (avoids bundler issues with static export)
     pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
   }
   return pdfjsLib;
@@ -115,7 +113,6 @@ function analyzeQuranLayout(imageData: ImageData): PageLayout {
     }
   }
 
-  // Non-verse pages (Cover, intro, tajwid guide) have < 5 regular slots
   const isVersePage = slots.length >= 5;
 
   // 2. Detect tall vertical frame lines
@@ -261,20 +258,23 @@ function findAyahRosetteMask(
 }
 
 /**
- * Apply precision fading only to Arabic verse text inside valid line slots.
+ * Apply precision fading (Model A: Light Gray or Model B: Outline).
  */
 function applyPrecisionFade(
   imageData: ImageData,
   layout: PageLayout,
   rosetteMask: Uint8Array,
-  opacity: number,
-  keepAyat: boolean,
+  options: ProcessOptions,
 ): void {
   if (!layout.isVersePage) return;
 
-  const { width, data } = imageData;
+  const { width, height, data } = imageData;
+  const model = options.model ?? "gray";
+  const opacity = options.opacity ?? 0.18;
+  const keepAyat = options.keepAyat ?? true;
 
-  const inSlot = new Uint8Array(imageData.width * imageData.height);
+  // Build slot lookup
+  const inSlot = new Uint8Array(width * height);
   for (const slot of layout.slots) {
     const y1 = slot.yTop + 2;
     const y2 = slot.yBot - 2;
@@ -286,18 +286,65 @@ function applyPrecisionFade(
     }
   }
 
+  // Pre-calculate dark text mask for outline computation
+  const isTextPixel = new Uint8Array(width * height);
   for (let offset = 0; offset < inSlot.length; offset++) {
     if (!inSlot[offset]) continue;
     if (layout.horizLineMask[offset]) continue;
     if (keepAyat && rosetteMask[offset]) continue;
 
     const idx = offset * 4;
-    const r = data[idx];
-    const g = data[idx + 1];
-    const b = data[idx + 2];
-    const brightness = (r + g + b) / 3;
+    const b = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
+    if (b < 190) {
+      isTextPixel[offset] = 1;
+    }
+  }
 
-    if (brightness < 190) {
+  if (model === "outline") {
+    // MODEL B: Outline (Hollow Letters)
+    // Edge pixel = text pixel adjacent to at least one non-text pixel
+    for (let y = 1; y < height - 1; y++) {
+      const rowOffset = y * width;
+      for (let x = layout.innerLeft; x <= layout.innerRight; x++) {
+        const offset = rowOffset + x;
+        if (!isTextPixel[offset]) continue;
+
+        // Check 8-neighborhood
+        const isEdge =
+          !isTextPixel[offset - 1] ||
+          !isTextPixel[offset + 1] ||
+          !isTextPixel[offset - width] ||
+          !isTextPixel[offset + width] ||
+          !isTextPixel[offset - width - 1] ||
+          !isTextPixel[offset - width + 1] ||
+          !isTextPixel[offset + width - 1] ||
+          !isTextPixel[offset + width + 1];
+
+        const idx = offset * 4;
+        if (isEdge) {
+          // Sharp gray outline line
+          const lineVal = Math.round(110 * (1 - opacity * 0.5));
+          data[idx] = lineVal;
+          data[idx + 1] = lineVal;
+          data[idx + 2] = lineVal;
+        } else {
+          // Hollow white inside
+          data[idx] = 255;
+          data[idx + 1] = 255;
+          data[idx + 2] = 255;
+        }
+      }
+    }
+  } else {
+    // MODEL A: Light Gray (FunFurqan standard)
+    for (let offset = 0; offset < inSlot.length; offset++) {
+      if (!isTextPixel[offset]) continue;
+
+      const idx = offset * 4;
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+
       data[idx]     = Math.round(r * opacity + 255 * (1 - opacity));
       data[idx + 1] = Math.round(g * opacity + 255 * (1 - opacity));
       data[idx + 2] = Math.round(b * opacity + 255 * (1 - opacity));
@@ -305,7 +352,29 @@ function applyPrecisionFade(
   }
 }
 
-// --- Single page processor ---
+// --- Render Original Page (for "Gambar Asli" tab) ---
+export async function renderOriginalPage(
+  file: File,
+  pageNum: number,
+  dpi = 140,
+): Promise<string> {
+  const pdfjs = await getPdfjs();
+  const arrayBuffer = await file.arrayBuffer();
+  const pdfDoc = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+  const page = await pdfDoc.getPage(pageNum);
+
+  const scale = dpi / 72;
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(viewport.width);
+  canvas.height = Math.round(viewport.height);
+  const ctx = canvas.getContext("2d")!;
+
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return canvas.toDataURL("image/jpeg", 0.92);
+}
+
+// --- Process single page to canvas ---
 async function processOnePage(
   pdfPage: import("pdfjs-dist").PDFPageProxy,
   options: ProcessOptions,
@@ -319,18 +388,14 @@ async function processOnePage(
   canvas.height = Math.round(viewport.height);
   const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
 
-  // Render PDF page to canvas
   await pdfPage.render({ canvasContext: ctx, viewport }).promise;
 
-  // Get pixel data
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
-  // Analyze page structure
   const layout = analyzeQuranLayout(imageData);
 
   if (layout.isVersePage) {
     const rosetteMask = findAyahRosetteMask(imageData, layout);
-    applyPrecisionFade(imageData, layout, rosetteMask, options.opacity, options.keepAyat ?? true);
+    applyPrecisionFade(imageData, layout, rosetteMask, options);
     ctx.putImageData(imageData, 0, 0);
   }
 
@@ -343,6 +408,7 @@ export async function processPdf(
   options: ProcessOptions,
   onProgress: ProgressCallback,
   cancelRef: { cancelled: boolean },
+  pageRange?: { start: number; end: number },
 ): Promise<void> {
   const pdfjs = await getPdfjs();
 
@@ -350,21 +416,23 @@ export async function processPdf(
   const pdfDoc = await pdfjs.getDocument({ data: arrayBuffer }).promise;
   const totalPages = pdfDoc.numPages;
 
-  // Output PDF
+  const startPage = pageRange ? Math.max(1, pageRange.start) : 1;
+  const endPage = pageRange ? Math.min(totalPages, pageRange.end) : totalPages;
+  const pagesToProcess = endPage - startPage + 1;
+
   const outDoc = await PDFDocument.create();
   const outputDpi = options.dpi ?? 180;
 
-  for (let i = 1; i <= totalPages; i++) {
+  let processedCount = 0;
+  for (let i = startPage; i <= endPage; i++) {
     if (cancelRef.cancelled) throw new Error("Dibatalkan");
 
     const page = await pdfDoc.getPage(i);
     const dataUrl = await processOnePage(page, options, outputDpi);
 
-    // Embed JPEG into output PDF
     const jpegBytes = dataUrlToUint8Array(dataUrl);
     const jpegImage = await outDoc.embedJpg(jpegBytes);
 
-    // Page size: match original (in PDF points)
     const viewport = page.getViewport({ scale: 1 });
     const pdfPage = outDoc.addPage([viewport.width, viewport.height]);
     pdfPage.drawImage(jpegImage, {
@@ -373,21 +441,55 @@ export async function processPdf(
       height: viewport.height,
     });
 
-    onProgress(i, totalPages);
+    processedCount++;
+    onProgress(processedCount, pagesToProcess);
   }
 
-  // Trigger download
   const pdfBytes = await outDoc.save();
   const blob = new Blob([pdfBytes as unknown as BlobPart], { type: "application/pdf" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = file.name.replace(/\.pdf$/i, "_trace.pdf");
+  const suffix = options.model === "outline" ? "_trace_outline.pdf" : "_trace.pdf";
+  a.download = file.name.replace(/\.pdf$/i, suffix);
   a.click();
   URL.revokeObjectURL(url);
 }
 
-// --- Preview: render ONE page (for preview panel) ---
+// --- Process single image file (JPG / PNG) ---
+export async function processSingleImage(
+  imageFile: File,
+  options: ProcessOptions,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+        ctx.drawImage(img, 0, 0);
+
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const layout = analyzeQuranLayout(imageData);
+        if (layout.isVersePage) {
+          const rosetteMask = findAyahRosetteMask(imageData, layout);
+          applyPrecisionFade(imageData, layout, rosetteMask, options);
+          ctx.putImageData(imageData, 0, 0);
+        }
+        resolve(canvas.toDataURL("image/jpeg", 0.92));
+      };
+      img.onerror = reject;
+      img.src = e.target?.result as string;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(imageFile);
+  });
+}
+
+// --- Preview single page ---
 export async function previewPage(
   file: File,
   pageNum: number,
