@@ -59,10 +59,10 @@ def detect_quran_layout(
     _, binary = cv2.threshold(gray, 190, 255, cv2.THRESH_BINARY_INV)
 
     # 1. Parameter proporsional terhadap ukuran gambar (bebas DPI)
-    kernel_horiz_w = max(120, int(w * 0.25))
+    kernel_horiz_w = max(60, int(w * 0.12))
     kernel_vert_h = max(100, int(h * 0.12))
-    min_row_spacing = int(h * 0.048)   # ~80px at 140 DPI, ~86px at 150 DPI, ~172px at 300 DPI
-    max_row_spacing = int(h * 0.082)   # banner judul surat (>0.09h) otomatis terfilter keluar
+    min_row_spacing = int(h * 0.045)   # ~68px at 150 DPI, ~136px at 300 DPI
+    max_row_spacing = int(h * 0.085)   # banner judul surat (>0.09h) otomatis terfilter keluar
 
     # 2. Deteksi garis pembatas horizontal tipis
     horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_horiz_w, 1))
@@ -74,7 +74,7 @@ def detect_quran_layout(
     start_y = 0
     for y in range(h):
         val = horiz_lines[y].mean()
-        if val > 5:
+        if val > 3.0:
             if not in_line:
                 in_line = True
                 start_y = y
