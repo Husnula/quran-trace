@@ -48,17 +48,19 @@ interface PageLayout {
 
 /**
  * Precision detection of Quran row divider lines, column frames, and slots.
+ * Scales dynamically to any canvas DPI / resolution.
  */
-function analyzeQuranLayout(imageData: ImageData, scale: number): PageLayout {
+function analyzeQuranLayout(imageData: ImageData): PageLayout {
   const { width, height, data } = imageData;
   const isDark = (idx: number) => {
     return (data[idx] + data[idx + 1] + data[idx + 2]) / 3 < 185;
   };
 
-  const minHorizRun = Math.max(180, Math.floor(220 * (scale / 1.5)));
-  const minVertRun = Math.max(140, Math.floor(180 * (scale / 1.5)));
-  const minRowSpacing = Math.max(50, Math.floor(65 * (scale / 1.5)));
-  const maxRowSpacing = Math.floor(135 * (scale / 1.5));
+  // Proportional parameters (resolution independent)
+  const minHorizRun = Math.round(width * 0.25);
+  const minVertRun = Math.round(height * 0.12);
+  const minRowSpacing = Math.round(height * 0.048);
+  const maxRowSpacing = Math.round(height * 0.082);
 
   // 1. Detect thin horizontal divider lines
   const horizLineRows = new Uint8Array(height);
@@ -78,7 +80,6 @@ function analyzeQuranLayout(imageData: ImageData, scale: number): PageLayout {
     }
     if (maxRun >= minHorizRun) {
       horizLineRows[y] = 1;
-      // Mark line pixels
       for (let x = 0; x < width; x++) {
         if (isDark((rowOffset + x) * 4)) {
           horizLineMask[rowOffset + x] = 1;
@@ -87,7 +88,7 @@ function analyzeQuranLayout(imageData: ImageData, scale: number): PageLayout {
     }
   }
 
-  // Group contiguous horizontal rows into single line positions
+  // Group contiguous horizontal rows into line positions
   const yLines: number[] = [];
   let inLine = false;
   let startY = 0;
@@ -157,17 +158,17 @@ function analyzeQuranLayout(imageData: ImageData, scale: number): PageLayout {
 function findAyahRosetteMask(
   imageData: ImageData,
   layout: PageLayout,
-  scale: number,
 ): Uint8Array {
   const { width, height, data } = imageData;
   const rosetteMask = new Uint8Array(width * height);
   if (!layout.isVersePage) return rosetteMask;
 
-  const minRosetteSize = Math.max(22, Math.floor(28 * (scale / 1.5)));
-  const maxRosetteSize = Math.floor(75 * (scale / 1.5));
-  const minPixels = Math.max(160, Math.floor(240 * (scale / 1.5)));
+  const minRosetteW = Math.round(width * 0.035);
+  const maxRosetteW = Math.round(width * 0.080);
+  const minRosetteH = Math.round(height * 0.025);
+  const maxRosetteH = Math.round(height * 0.060);
+  const minPixels = Math.round(width * height * 0.00050);
 
-  // Analyze dark connected components within each verse slot
   const visited = new Uint8Array(width * height);
   const queueX = new Int32Array(width * height);
   const queueY = new Int32Array(width * height);
@@ -184,9 +185,8 @@ function findAyahRosetteMask(
 
         const idx = offset * 4;
         const brightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-        if (brightness >= 185) continue; // background
+        if (brightness >= 185) continue;
 
-        // BFS connected component
         let qHead = 0;
         let qTail = 0;
         queueX[qTail] = x;
@@ -208,7 +208,6 @@ function findAyahRosetteMask(
           if (cy < minY) minY = cy;
           if (cy > maxY) maxY = cy;
 
-          // 4-connected neighbors
           const neighbors = [
             [cx + 1, cy], [cx - 1, cy],
             [cx, cy + 1], [cx, cy - 1]
@@ -235,10 +234,9 @@ function findAyahRosetteMask(
         const bh = maxY - minY + 1;
         const aspect = bw / bh;
 
-        // Ayah Rosette characteristics: symmetrical, dense, medium size
         if (
-          bw >= minRosetteSize && bw <= maxRosetteSize &&
-          bh >= minRosetteSize && bh <= maxRosetteSize &&
+          bw >= minRosetteW && bw <= maxRosetteW &&
+          bh >= minRosetteH && bh <= maxRosetteH &&
           aspect >= 0.70 && aspect <= 1.30 &&
           count >= minPixels
         ) {
@@ -272,11 +270,10 @@ function applyPrecisionFade(
   opacity: number,
   keepAyat: boolean,
 ): void {
-  if (!layout.isVersePage) return; // Leave cover / non-verse pages 100% untouched
+  if (!layout.isVersePage) return;
 
   const { width, data } = imageData;
 
-  // Build slot lookup
   const inSlot = new Uint8Array(imageData.width * imageData.height);
   for (const slot of layout.slots) {
     const y1 = slot.yTop + 2;
@@ -290,13 +287,8 @@ function applyPrecisionFade(
   }
 
   for (let offset = 0; offset < inSlot.length; offset++) {
-    // Only fade pixels that are inside a valid verse slot
     if (!inSlot[offset]) continue;
-
-    // Do NOT fade horizontal lines
     if (layout.horizLineMask[offset]) continue;
-
-    // Do NOT fade Ayah rosettes if keepAyat is true
     if (keepAyat && rosetteMask[offset]) continue;
 
     const idx = offset * 4;
@@ -305,7 +297,6 @@ function applyPrecisionFade(
     const b = data[idx + 2];
     const brightness = (r + g + b) / 3;
 
-    // Fade dark verse text & harakat smoothly
     if (brightness < 190) {
       data[idx]     = Math.round(r * opacity + 255 * (1 - opacity));
       data[idx + 1] = Math.round(g * opacity + 255 * (1 - opacity));
@@ -324,8 +315,8 @@ async function processOnePage(
   const viewport = pdfPage.getViewport({ scale });
 
   const canvas = document.createElement("canvas");
-  canvas.width = viewport.width;
-  canvas.height = viewport.height;
+  canvas.width = Math.round(viewport.width);
+  canvas.height = Math.round(viewport.height);
   const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
 
   // Render PDF page to canvas
@@ -335,10 +326,10 @@ async function processOnePage(
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
   // Analyze page structure
-  const layout = analyzeQuranLayout(imageData, scale);
+  const layout = analyzeQuranLayout(imageData);
 
   if (layout.isVersePage) {
-    const rosetteMask = findAyahRosetteMask(imageData, layout, scale);
+    const rosetteMask = findAyahRosetteMask(imageData, layout);
     applyPrecisionFade(imageData, layout, rosetteMask, options.opacity, options.keepAyat ?? true);
     ctx.putImageData(imageData, 0, 0);
   }

@@ -5,8 +5,8 @@ Deteksi dan proteksi penanda nomor ayat (Ayah Rosettes) dan tanda waqf margin.
 Prinsip deteksi:
 1. Roset Nomor Ayat (Bunga/Lingkaran Ayat):
    - Berupa ornamen bunga/lingkaran dengan ukiran berulang dan angka ayat di dalamnya.
-   - Memiliki kontur berlapis (hierarchy child_count >= 8) dan area > 1000 px².
-   - Aspek rasio simetris (~0.70 - 1.30) dan ukuran standar (~30 - 80 px).
+   - Memiliki kontur berlapis (hierarchy child_count >= 8) dan area proporsional.
+   - Aspek rasio simetris (~0.70 - 1.30).
    - Dipertahankan 100% hitam pekat agar nomor ayat tetap jelas dibaca.
 
 2. Tanda Waqf Margin (misal Waqf Lazim 'ع' / Ruku' di kolom margin luar):
@@ -26,22 +26,15 @@ from .region_detector import QuranLayout
 def detect_ayah_rosettes(
     binary: np.ndarray,
     layout: QuranLayout,
-    min_size: int = 30,
-    max_size: int = 80,
-    min_area: float = 1000.0,
-    min_children: int = 8,
     pad: int = 3,
 ) -> np.ndarray:
     """
     Deteksi roset nomor ayat di dalam zona teks menggunakan analisa hierarki kontur.
+    Thresholds dihitung proporsional terhadap ukuran gambar agar independen DPI.
 
     Args:
         binary: gambar biner inversi (foreground = 255)
         layout: QuranLayout hasil deteksi region_detector
-        min_size: lebar/tinggi minimum roset
-        max_size: lebar/tinggi maksimum roset
-        min_area: luas kontur minimum
-        min_children: jumlah anak kontur minimum (lingkaran ornamen + angka)
         pad: padding pixel pelindung di sekitar roset
 
     Returns:
@@ -53,6 +46,14 @@ def detect_ayah_rosettes(
     if not layout.is_verse_page:
         return rosette_mask
 
+    # Thresholds proporsional terhadap resolusi
+    min_bw = int(w * 0.035)
+    max_bw = int(w * 0.080)
+    min_bh = int(h * 0.025)
+    max_bh = int(h * 0.060)
+    min_area = float(w * h * 0.00045)
+    min_children = 8
+
     contours, hierarchy = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     if hierarchy is None or len(contours) == 0:
         return rosette_mask
@@ -63,7 +64,7 @@ def detect_ayah_rosettes(
 
         # Harus berada di dalam rentang kolom teks ayat
         if layout.inner_left <= x and x + bw <= layout.inner_right:
-            if min_size <= bw <= max_size and min_size <= bh <= max_size:
+            if min_bw <= bw <= max_bw and min_bh <= bh <= max_bh:
                 aspect = bw / float(bh)
                 if 0.70 <= aspect <= 1.30:
                     # Hitung anak kontur (child hierarchy)

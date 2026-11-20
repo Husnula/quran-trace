@@ -2,11 +2,12 @@
 processor/region_detector.py
 Deteksi grid slot baris ayat, border ornamen, dan margin mushaf.
 
-Menggunakan analisa morfologi presisi:
-- Deteksi garis horizontal divider baris (morphological opening 280x1)
-- Deteksi garis vertikal frame mushaf (morphological opening 1x200)
-- Identifikasi inner text column (memisahkan kolom teks dari kolom margin waqf/ruku')
-- Klasifikasi halaman ayat vs halaman non-ayat (cover, daftar tajwid, dll.)
+Menggunakan analisa morfologi adaptif terhadap resolusi / DPI:
+- Deteksi garis horizontal divider baris (panjang garis >= 25% lebar halaman)
+- Filter slot baris ayat secara adaptif (4.8% s.d. 8.2% dari tinggi halaman)
+- Deteksi garis vertikal frame mushaf (tinggi garis >= 12% dari tinggi halaman)
+- Penentuan inner_left dan inner_right (melindungi kolom margin luar seperti waqf lazim 'ع')
+- Klasifikasi otomatis halaman ayat vs non-ayat (cover, daftar tajwid, dll.)
 """
 from __future__ import annotations
 import cv2
@@ -28,18 +29,14 @@ class QuranLayout:
 
 def detect_quran_layout(
     img: Image.Image | np.ndarray,
-    min_row_spacing: int = 75,
-    max_row_spacing: int = 122,
     min_verse_slots: int = 5,
 ) -> QuranLayout:
     """
-    Analisa struktur halaman mushaf secara matematis.
+    Analisa struktur halaman mushaf secara matematis dan proporsional (skala-independen).
 
     Args:
         img: PIL Image atau numpy array BGR/RGB
-        min_row_spacing: tinggi minimum slot baris ayat (px at ~150 DPI)
-        max_row_spacing: tinggi maksimum slot baris ayat (px at ~150 DPI)
-        min_verse_slots: jumlah minimum slot agar dianggap halaman ayat
+        min_verse_slots: jumlah minimum slot agar dianggap halaman ayat (default: 5)
 
     Returns:
         QuranLayout
@@ -61,8 +58,14 @@ def detect_quran_layout(
     h, w = gray.shape[:2]
     _, binary = cv2.threshold(gray, 190, 255, cv2.THRESH_BINARY_INV)
 
-    # 1. Deteksi garis pembatas horizontal tipis (> 280 px lebar, 1-3 px tinggi)
-    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (280, 1))
+    # 1. Parameter proporsional terhadap ukuran gambar (bebas DPI)
+    kernel_horiz_w = max(120, int(w * 0.25))
+    kernel_vert_h = max(100, int(h * 0.12))
+    min_row_spacing = int(h * 0.048)   # ~80px at 140 DPI, ~86px at 150 DPI, ~172px at 300 DPI
+    max_row_spacing = int(h * 0.082)   # banner judul surat (>0.09h) otomatis terfilter keluar
+
+    # 2. Deteksi garis pembatas horizontal tipis
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_horiz_w, 1))
     horiz_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horiz_kernel)
 
     # Cari posisi Y tengah dari setiap garis horizontal
@@ -80,7 +83,7 @@ def detect_quran_layout(
                 in_line = False
                 y_lines.append((start_y + y) // 2)
 
-    # Cari slot baris ayat yang valid (jarak antar garis sesuai tinggi baris teks)
+    # Cari slot baris ayat yang valid (jarak antar garis sesuai baris teks)
     slots: list[tuple[int, int]] = []
     for i in range(len(y_lines) - 1):
         spacing = y_lines[i + 1] - y_lines[i]
@@ -91,17 +94,17 @@ def detect_quran_layout(
     # Tandai sebagai non-verse page agar tidak disentuh sama sekali
     is_verse_page = len(slots) >= min_verse_slots
 
-    # 2. Deteksi garis frame vertikal (> 200 px tinggi)
-    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 200))
+    # 3. Deteksi garis frame vertikal
+    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_vert_h))
     vert_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vert_kernel)
 
     v_indices = np.where(vert_lines.mean(axis=0) > 2)[0]
     left_v = v_indices[v_indices < w // 2]
     right_v = v_indices[v_indices >= w // 2]
 
-    # Inner left bound: garis terkanan di sisi kiri frame (melindungi kolom margin waqf/ruku')
+    # Inner left bound: garis terdalam di sisi kiri frame (melindungi kolom margin waqf/ruku')
     inner_left = int(left_v[-1] + 2) if len(left_v) > 0 else int(w * 0.14)
-    # Inner right bound: garis terkiri di sisi kanan frame (melindungi kolom margin kanan)
+    # Inner right bound: garis terdalam di sisi kanan frame (melindungi kolom margin kanan)
     inner_right = int(right_v[0] - 2) if len(right_v) > 0 else int(w * 0.88)
 
     return QuranLayout(
