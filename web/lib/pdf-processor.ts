@@ -230,12 +230,40 @@ function findAyahRosetteMask(
         const bw = maxX - minX + 1;
         const bh = maxY - minY + 1;
         const aspect = bw / bh;
+        const fillDensity = count / (bw * bh);
+
+        // Check horizontal transitions to ensure it is an ornate rosette (outer ring + inner ring + digit)
+        // and NOT a solid Arabic word (like 'بِكُمْ' or 'ذَهَبَ')
+        let maxHTransitions = 0;
+        const sampleYs = [
+          Math.floor((minY + maxY) / 2),
+          Math.floor((minY + maxY) / 2) - 3,
+          Math.floor((minY + maxY) / 2) + 3,
+        ];
+
+        for (const testY of sampleYs) {
+          if (testY >= yStart && testY <= yEnd) {
+            let transitions = 0;
+            let lastDark = false;
+            for (let x = minX; x <= maxX; x++) {
+              const o = (testY * width + x) * 4;
+              const isDarkPixel = (data[o] + data[o + 1] + data[o + 2]) / 3 < 185;
+              if (isDarkPixel !== lastDark) {
+                transitions++;
+                lastDark = isDarkPixel;
+              }
+            }
+            if (transitions > maxHTransitions) maxHTransitions = transitions;
+          }
+        }
 
         if (
           bw >= minRosetteW && bw <= maxRosetteW &&
           bh >= minRosetteH && bh <= maxRosetteH &&
           aspect >= 0.70 && aspect <= 1.30 &&
-          count >= minPixels
+          count >= minPixels &&
+          fillDensity <= 0.38 && // Exclude solid Arabic words
+          maxHTransitions >= 5  // Must have nested circular/petal transitions
         ) {
           const pad = 3;
           const py1 = Math.max(0, minY - pad);

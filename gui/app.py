@@ -36,6 +36,7 @@ class TraceQuranApp(tk.Tk):
         self._processing: bool = False
 
         # Tkinter variables
+        self._model_var = tk.StringVar(value="gray")
         self._fade_preset = tk.StringVar(value=FADE_DEFAULT)
         self._opacity_var = tk.DoubleVar(value=FADE_PRESETS[FADE_DEFAULT])
         self._keep_border = tk.BooleanVar(value=True)
@@ -120,6 +121,25 @@ class TraceQuranApp(tk.Tk):
             anchor="w", wraplength=PANEL_LEFT_W - 32,
         )
         self._file_label.pack(fill=tk.X, padx=p, pady=(4, p))
+        _divider(frame)
+
+        # ── Model Tracing ──────────────────────────────────────────────────
+        _section_label(frame, "MODEL TRACING")
+        for val, text, desc in [
+            ("gray", "Model A: Light Gray", "Abu-abu tipis presisi (standar)"),
+            ("outline", "Model B: Outline", "Garis tepi tipis, huruf putih hollow"),
+        ]:
+            rb = tk.Radiobutton(
+                frame, text=f"{text}\n  {desc}",
+                variable=self._model_var, value=val,
+                font=FONTS["label"], bg=COLORS["bg_panel"],
+                fg=COLORS["text_primary"],
+                selectcolor=COLORS["accent_light"],
+                activebackground=COLORS["bg_panel"],
+                justify=tk.LEFT,
+                command=self._do_preview,
+            )
+            rb.pack(anchor="w", padx=p, pady=2)
         _divider(frame)
 
         # ── Fade Level ────────────────────────────────────────────────────
@@ -332,6 +352,7 @@ class TraceQuranApp(tk.Tk):
                 img = preview_page(
                     self._pdf_path,
                     page_num=self._preview_page_num,
+                    model=self._model_var.get(),
                     opacity=self._opacity_var.get(),
                     keep_waqf=self._keep_waqf.get(),
                     keep_ayat=self._keep_ayat.get(),
@@ -389,6 +410,7 @@ class TraceQuranApp(tk.Tk):
                 result = process_pdf(
                     self._pdf_path,
                     output_path=output,
+                    model=self._model_var.get(),
                     opacity=self._opacity_var.get(),
                     keep_border=self._keep_border.get(),
                     keep_waqf=self._keep_waqf.get(),
